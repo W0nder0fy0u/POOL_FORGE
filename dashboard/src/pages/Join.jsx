@@ -2,6 +2,7 @@
 import { useEffect, useState } from "react";
 import { Link, useParams } from "react-router-dom";
 import { api } from "../api.js";
+import ThemeToggle from "../components/ThemeToggle.jsx";
 import { CopyBox } from "../components/ui.jsx";
 
 export default function Join() {
@@ -20,6 +21,8 @@ export default function Join() {
         <a className="brand" href="/">
           <img src="/favicon.svg" alt="" /> PoolForge
         </a>
+        <span className="spacer" />
+        <ThemeToggle />
       </header>
       <main className="stack" style={{ maxWidth: 820 }}>
         <h1>Join pool {code}</h1>

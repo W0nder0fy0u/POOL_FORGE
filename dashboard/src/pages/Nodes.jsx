@@ -67,9 +67,9 @@ function NodeCard({ node, color }) {
             value={node.ram_free_gb}
             max={node.ram_cap_gb || node.ram_total_gb}
             text={`${fmtNum(node.ram_free_gb, 2)} / ${fmtNum(node.ram_cap_gb || node.ram_total_gb, 1)} GB`}
-            color="var(--series-3)"
+            color="var(--accent)"
           />
-          <Meter label="CPU" value={node.cpu_percent} max={100} text={`${fmtNum(node.cpu_percent, 0)} %`} color="var(--series-1)" />
+          <Meter label="CPU" value={node.cpu_percent} max={100} text={`${fmtNum(node.cpu_percent, 0)} %`} color="var(--accent-2)" />
           <div className="row small secondary" style={{ marginTop: "0.6rem" }}>
             <span>Agent RAM: {fmtNum(node.proc_ram_mb, 0)} MB</span>
             <span>Machine used: {fmtNum(usedGb, 1)} GB</span>

@@ -11,6 +11,9 @@ import Nodes from "./pages/Nodes.jsx";
 import Reports from "./pages/Reports.jsx";
 import Training from "./pages/Training.jsx";
 import "./styles.css";
+import { applyTheme, savedTheme } from "./components/ThemeToggle.jsx";
+
+applyTheme(savedTheme());
 
 ReactDOM.createRoot(document.getElementById("root")).render(
   <React.StrictMode>

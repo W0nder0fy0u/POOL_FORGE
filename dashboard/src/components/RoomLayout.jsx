@@ -3,6 +3,7 @@
 import { useState } from "react";
 import { NavLink, Outlet, useParams } from "react-router-dom";
 import { RoomProvider, useRoom } from "../room.jsx";
+import ThemeToggle from "./ThemeToggle.jsx";
 import { StatusPill } from "./ui.jsx";
 
 export default function RoomLayout() {
@@ -44,6 +45,7 @@ function Frame() {
         <span className="pill">{online} node{online === 1 ? "" : "s"} online</span>
         <StatusPill status={isAdmin ? "online" : "idle"} label={isAdmin ? "Admin" : "Viewer"} />
         <StatusPill status={conn} label={CONN_LABEL[conn]} />
+        <ThemeToggle />
       </header>
       <main className="stack">
         {conn === "missing" && <div className="banner error">Room {code} does not exist. Check the code or create a new pool.</div>}

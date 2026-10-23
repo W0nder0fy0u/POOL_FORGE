@@ -2,6 +2,7 @@
 import { useState } from "react";
 import { useNavigate } from "react-router-dom";
 import { api, setAdminToken } from "../api.js";
+import ThemeToggle from "../components/ThemeToggle.jsx";
 import { CopyBox } from "../components/ui.jsx";
 
 export default function Home() {
@@ -31,6 +32,8 @@ export default function Home() {
         <a className="brand" href="/">
           <img src="/favicon.svg" alt="" /> PoolForge
         </a>
+        <span className="spacer" />
+        <ThemeToggle />
       </header>
       <main className="stack">
         <section className="hero">
