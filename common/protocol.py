@@ -1,36 +1,42 @@
-"""PoolForge Binary Tensor Wire Protocol.
+"""PoolForge binary tensor wire format (NO pickle, ever).
 
-Provides secure, pickle-free serialization and framing for PyTorch tensors
-over network transports (Relay and DirectTCP).
+One tensor frame looks like this:
 
-Wire Frame Layout (unencrypted):
-+-------------------+--------------------+------------------------+
-| 4-byte uint32     | N-byte JSON Header | M-byte Raw Tensor Data |
-| Big-Endian Length | {kind, dtype, ...} | (IEEE 754 float/int)   |
-+-------------------+--------------------+------------------------+
+    +----------------+----------------------+---------------------+
+    | 4 bytes        | N bytes              | M bytes             |
+    | header length  | JSON header (UTF-8)  | raw tensor bytes    |
+    | (big-endian)   | {kind, dtype, ...}   | (or AES ciphertext) |
+    +----------------+----------------------+---------------------+
 
-Wire Frame Layout (encrypted, when key is provided):
-+-------------------+--------------------+---------------------------------------+
-| 4-byte uint32     | N-byte JSON Header | 12-byte nonce + AES-GCM ciphertext   |
-| Big-Endian Length | {kind, dtype, ...} | (encrypted raw tensor bytes + 16B tag)|
-+-------------------+--------------------+---------------------------------------+
+The receiver reads the JSON header first, checks every field, and only then
+rebuilds the tensor with torch.frombuffer(...).reshape(shape). Because the
+payload is just numbers plus a JSON description, a malicious peer cannot make
+us execute code (which is exactly what pickle would allow).
 
-Encryption is optional and only applied to the raw tensor bytes (not the header).
-The JSON header carries an ``encrypted`` flag so receivers know how to decode.
+Optional encryption (Phase 8): only the raw bytes are encrypted; the header
+stays readable and carries "encrypted": true.
 """
 
 import json
+import math
 import struct
 from typing import Any, Dict, Optional, Tuple
+
 import torch
 
-# Standard header length is a 4-byte unsigned big-endian integer
-HEADER_LEN_STRUCT = struct.Struct(">I")
-UINT32_STRUCT = HEADER_LEN_STRUCT
+# 4-byte unsigned big-endian integer used for every length prefix in PoolForge.
+UINT32 = struct.Struct(">I")
+UINT32_STRUCT = UINT32  # backwards-compatible alias
 
+# Hard limits so a bad peer can't make us allocate absurd amounts of memory.
+MAX_HEADER_BYTES = 64 * 1024
+MAX_PAYLOAD_BYTES = 512 * 1024 * 1024  # 512 MB per tensor
 
-# Supported torch dtypes mapping for deterministic conversion
-DTYPE_STR_MAP = {
+# Allowed message kinds on the data plane.
+KINDS = ("activation", "gradient", "labels")
+
+# dtype <-> string table (only plain numeric types are allowed on the wire).
+DTYPE_TO_STR = {
     torch.float32: "float32",
     torch.float64: "float64",
     torch.float16: "float16",
@@ -42,8 +48,7 @@ DTYPE_STR_MAP = {
     torch.uint8: "uint8",
     torch.bool: "bool",
 }
-
-STR_DTYPE_MAP = {v: k for k, v in DTYPE_STR_MAP.items()}
+STR_TO_DTYPE = {v: k for k, v in DTYPE_TO_STR.items()}
 
 
 def serialize_tensor(
@@ -52,126 +57,103 @@ def serialize_tensor(
     job_id: str = "",
     step: int = 0,
     microbatch: int = 0,
-    extra: Optional[Dict[str, Any]] = None,
     encrypt_key: Optional[bytes] = None,
 ) -> bytes:
-    """Serialize a PyTorch tensor into the PoolForge binary wire format.
-
-    Args:
-        tensor: The torch.Tensor to serialize.
-        kind: Message kind: "activation", "gradient", "labels", or "checkpoint".
-        job_id: Identifier of the running training job.
-        step: Current training step.
-        microbatch: Micro-batch index within the current step.
-        extra: Optional arbitrary JSON-serializable metadata.
-        encrypt_key: Optional 32-byte AES-256 key.  When provided the raw tensor
-            bytes are encrypted with AES-GCM (via ``common.crypto.encrypt_payload``)
-            and the header carries ``"encrypted": true`` so the receiver knows to
-            decrypt.  Pass ``None`` (default) for plaintext transport.
-
-    Returns:
-        Framed bytes ready for transmission over WebSocket or TCP.
-    """
+    """Turn a tensor into one framed message: [len][JSON header][raw bytes]."""
     if not isinstance(tensor, torch.Tensor):
-        raise TypeError(f"Expected torch.Tensor, got {type(tensor)}")
+        raise TypeError(f"Expected torch.Tensor, got {type(tensor).__name__}")
+    if kind not in KINDS:
+        raise ValueError(f"Unknown frame kind '{kind}', expected one of {KINDS}")
 
-    # Ensure tensor is contiguous and on CPU for byte extraction
-    t_cpu = tensor.detach().cpu().contiguous()
-
-    # Extract raw bytes directly via uint8 view without pickle or intermediate copies
-    raw_bytes = t_cpu.view(torch.uint8).numpy().tobytes()
-
-    dtype_str = DTYPE_STR_MAP.get(t_cpu.dtype)
+    t = tensor.detach().cpu().contiguous()
+    dtype_str = DTYPE_TO_STR.get(t.dtype)
     if dtype_str is None:
-        raise ValueError(f"Unsupported tensor dtype for wire protocol: {t_cpu.dtype}")
+        raise ValueError(f"Unsupported dtype for the wire: {t.dtype}")
+
+    # View the tensor memory as bytes (no pickle, no Python objects).
+    raw = t.reshape(-1).view(torch.uint8).numpy().tobytes() if t.numel() else b""
 
     encrypted = False
     if encrypt_key is not None:
-        # Only the tensor payload bytes are encrypted; the JSON header stays plaintext
-        # so the receiver can read shape/dtype before decryption.
         from common.crypto import encrypt_payload
-        raw_bytes = encrypt_payload(raw_bytes, encrypt_key)
+
+        raw = encrypt_payload(raw, encrypt_key)
         encrypted = True
 
-    header_dict = {
+    header = {
         "kind": kind,
         "dtype": dtype_str,
-        "shape": list(t_cpu.shape),
+        "shape": list(t.shape),
         "job_id": job_id,
-        "step": step,
-        "microbatch": microbatch,
-        "num_bytes": len(raw_bytes),
+        "step": int(step),
+        "microbatch": int(microbatch),
+        "num_bytes": len(raw),
         "encrypted": encrypted,
     }
+    header_bytes = json.dumps(header, separators=(",", ":")).encode("utf-8")
+    return UINT32.pack(len(header_bytes)) + header_bytes + raw
 
-    if extra:
-        header_dict["extra"] = extra
 
-    header_bytes = json.dumps(header_dict, separators=(",", ":")).encode("utf-8")
-    header_len = len(header_bytes)
+def read_header(data: bytes) -> Tuple[Dict[str, Any], int]:
+    """Parse and validate only the JSON header. Returns (header, payload_offset)."""
+    if len(data) < UINT32.size:
+        raise ValueError(f"Frame too short: {len(data)} bytes")
+    (header_len,) = UINT32.unpack_from(data, 0)
+    if header_len > MAX_HEADER_BYTES:
+        raise ValueError(f"Header too large: {header_len} bytes")
+    end = UINT32.size + header_len
+    if len(data) < end:
+        raise ValueError("Frame truncated inside the header")
 
-    # Wire format: [4-byte header length][JSON header][raw tensor bytes]
-    return HEADER_LEN_STRUCT.pack(header_len) + header_bytes + raw_bytes
+    try:
+        header = json.loads(bytes(data[UINT32.size:end]).decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise ValueError(f"Header is not valid JSON: {exc}") from exc
+    if not isinstance(header, dict):
+        raise ValueError("Header must be a JSON object")
+
+    # Validate every field we rely on.
+    if header.get("kind") not in KINDS:
+        raise ValueError(f"Bad kind: {header.get('kind')!r}")
+    if header.get("dtype") not in STR_TO_DTYPE:
+        raise ValueError(f"Bad dtype: {header.get('dtype')!r}")
+    shape = header.get("shape")
+    if not isinstance(shape, list) or not all(isinstance(d, int) and d >= 0 for d in shape):
+        raise ValueError(f"Bad shape: {shape!r}")
+    for field in ("step", "microbatch", "num_bytes"):
+        if not isinstance(header.get(field), int) or header[field] < 0:
+            raise ValueError(f"Bad {field}: {header.get(field)!r}")
+    if not isinstance(header.get("job_id"), str):
+        raise ValueError("Bad job_id")
+    if header["num_bytes"] > MAX_PAYLOAD_BYTES:
+        raise ValueError(f"Payload too large: {header['num_bytes']} bytes")
+    return header, end
 
 
 def deserialize_tensor(
-    data: bytes,
-    decrypt_key: Optional[bytes] = None,
+    data: bytes, decrypt_key: Optional[bytes] = None
 ) -> Tuple[torch.Tensor, Dict[str, Any]]:
-    """Deserialize binary wire format into a PyTorch tensor and its metadata header.
+    """Rebuild (tensor, header) from a frame produced by serialize_tensor."""
+    header, offset = read_header(data)
+    raw = data[offset:]
+    if len(raw) != header["num_bytes"]:
+        raise ValueError(f"Payload is {len(raw)} bytes, header says {header['num_bytes']}")
 
-    Args:
-        data: Framed bytes received from the network.
-        decrypt_key: Optional 32-byte AES-256 key.  Must be provided (and match the
-            sender's key) when the header carries ``"encrypted": true``.  If ``None``
-            and the packet is flagged as encrypted a ``ValueError`` is raised.
-
-    Returns:
-        (tensor, header_dict) where tensor has the original shape, dtype, and contents,
-        and is detached with its own memory copy (ready for autograd)."""
-    """
-    if len(data) < HEADER_LEN_STRUCT.size:
-        raise ValueError(f"Packet too short to contain header length: {len(data)} bytes")
-
-    (header_len,) = HEADER_LEN_STRUCT.unpack_from(data, 0)
-    header_start = HEADER_LEN_STRUCT.size
-    header_end = header_start + header_len
-
-    if len(data) < header_end:
-        raise ValueError(
-            f"Packet truncated: claims header length {header_len}, but total payload is {len(data)} bytes"
-        )
-
-    header_str = data[header_start:header_end].decode("utf-8")
-    header = json.loads(header_str)
-
-    dtype_str = header.get("dtype")
-    shape = header.get("shape")
-    num_bytes = header.get("num_bytes")
-
-    if dtype_str not in STR_DTYPE_MAP:
-        raise ValueError(f"Unknown dtype in tensor header: {dtype_str}")
-
-    torch_dtype = STR_DTYPE_MAP[dtype_str]
-    raw_bytes = data[header_end:]
-
-    if num_bytes is not None and len(raw_bytes) != num_bytes:
-        raise ValueError(
-            f"Corrupt tensor payload: expected {num_bytes} bytes from header, got {len(raw_bytes)}"
-        )
-
-    # Decrypt payload if the sender flagged it as encrypted
-    if header.get("encrypted", False):
+    if header.get("encrypted"):
         if decrypt_key is None:
-            raise ValueError(
-                "Received encrypted tensor payload but no decrypt_key was provided. "
-                "Pass the room key via decrypt_key= parameter."
-            )
+            raise ValueError("Frame is encrypted but no key was given (use --encrypt-passphrase)")
         from common.crypto import decrypt_payload
-        raw_bytes = decrypt_payload(raw_bytes, decrypt_key)
 
-    # Make buffer writable to ensure autograd safety and suppress PyTorch non-writable buffer warnings
-    writable_bytes = bytearray(raw_bytes)
-    tensor = torch.frombuffer(writable_bytes, dtype=torch_dtype).reshape(shape).clone()
+        raw = decrypt_payload(bytes(raw), decrypt_key)
 
+    dtype = STR_TO_DTYPE[header["dtype"]]
+    shape = header["shape"]
+    expected = math.prod(shape) * torch.empty((), dtype=dtype).element_size()
+    if len(raw) != expected:
+        raise ValueError(f"Shape {shape} of {header['dtype']} needs {expected} bytes, got {len(raw)}")
+
+    if expected == 0:
+        return torch.empty(shape, dtype=dtype), header
+    # bytearray gives frombuffer a writable buffer; clone() gives the tensor its own memory.
+    tensor = torch.frombuffer(bytearray(raw), dtype=dtype).reshape(shape).clone()
     return tensor, header

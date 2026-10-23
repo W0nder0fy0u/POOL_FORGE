@@ -1,338 +1,338 @@
-"""PoolForge Transport Implementations.
+"""PoolForge data-plane transports (how tensor frames move between nodes).
 
-Defines the pluggable Transport interface and provides:
-1. RelayTransport: Default WAN-ready transport routing binary tensor frames through
-   the Coordinator via WebSockets (works behind home routers/NATs without port forwarding).
-2. DirectTCPTransport: High-throughput raw TCP transport for LAN/Tailscale environments.
+Every transport implements the same small interface, so the training code
+never knows (or cares) how bytes travel:
+
+    await t.start()
+    await t.send(target_node_id, frame_bytes)
+    sender_id, frame_bytes = await t.recv()
+    await t.stop()
+
+Implementations:
+  * RelayTransport     - default. One outbound WebSocket to the coordinator,
+                         which forwards frames to the target node. Works
+                         behind any home router / NAT (no port forwarding).
+  * DirectTCPTransport - node-to-node TCP sockets. Faster, but peers must be
+                         reachable (same LAN, hotspot or Tailscale).
+  * LocalTransport     - in-process queues, used by tests and benchmarks.
+
+Simulated latency (--simulate-latency-ms) is applied to every INCOMING frame:
+a frame only becomes visible to recv() `latency` ms after it arrived. This is
+like a slow network link and, unlike sleeping in send(), it does not block the
+sender (so micro-batching can still hide the latency, as on a real network).
 """
 
 import abc
 import asyncio
+import hmac
 import logging
-import struct
 import time
-from typing import Any, Dict, Optional, Tuple
-import websockets
+from typing import Dict, Optional, Tuple
 
-logger = logging.getLogger("poolforge.transports")
+from common.protocol import UINT32
 
-# 4-byte big-endian length struct used in framing
-UINT32_STRUCT = struct.Struct(">I")
+logger = logging.getLogger("poolforge.transport")
+
+MAX_FRAME_BYTES = 600 * 1024 * 1024  # header + 512 MB tensor + envelope
+
+
+def _pack_id(node_id: str) -> bytes:
+    """Encode a node id as [4-byte length][utf-8 bytes]."""
+    raw = node_id.encode("utf-8")
+    return UINT32.pack(len(raw)) + raw
+
+
+def _unpack_id(data: bytes) -> Tuple[str, bytes]:
+    """Inverse of _pack_id: returns (node_id, rest_of_data)."""
+    if len(data) < UINT32.size:
+        raise ValueError("Envelope too short")
+    (n,) = UINT32.unpack_from(data, 0)
+    if n > 256 or len(data) < UINT32.size + n:
+        raise ValueError("Bad node id length in envelope")
+    node_id = bytes(data[UINT32.size:UINT32.size + n]).decode("utf-8")
+    return node_id, data[UINT32.size + n:]
 
 
 class Transport(abc.ABC):
-    """Abstract base class for all PoolForge data plane tensor transports."""
+    """Common base: an inbox queue, byte/latency counters and simulated latency."""
+
+    name = "base"
 
     def __init__(self, node_id: str, simulate_latency_ms: float = 0.0):
         self.node_id = node_id
-        self.simulate_latency_ms = simulate_latency_ms
-        self.total_bytes_sent = 0
-        self.total_bytes_received = 0
-        self.send_latencies_ms: list[float] = []
-        self.recv_latencies_ms: list[float] = []
-        self._running = False
+        self.simulate_latency_ms = float(simulate_latency_ms)
+        # Inbox items: (time when deliverable, sender_id, payload)
+        self._inbox: "asyncio.Queue[Tuple[float, str, bytes]]" = asyncio.Queue()
+        # Counters (cumulative) + a "since last snapshot" copy for per-step stats.
+        self.bytes_sent = 0
+        self.bytes_received = 0
+        self.frames_sent = 0
+        self.send_time_ms = 0.0  # total time spent inside send()
+        self._snap = (0, 0, 0, 0.0)
+
+    # ----- interface -------------------------------------------------------
+    @abc.abstractmethod
+    async def start(self) -> None: ...
 
     @abc.abstractmethod
-    async def start(self) -> None:
-        """Initialize transport listener or client connections."""
-        pass
+    async def stop(self) -> None: ...
 
     @abc.abstractmethod
-    async def stop(self) -> None:
-        """Gracefully shut down transport connections."""
-        pass
+    async def _send_raw(self, target_node_id: str, payload: bytes) -> int:
+        """Actually send; return number of bytes put on the wire."""
 
-    @abc.abstractmethod
-    async def send_tensor(self, target_node_id: str, payload: bytes) -> None:
-        """Send framed tensor payload to a target node.
-
-        Args:
-            target_node_id: Identifier of the destination node.
-            payload: Binary serialized tensor bytes.
-        """
-        pass
-
-    @abc.abstractmethod
-    async def receive_tensor(self, timeout: Optional[float] = None) -> Tuple[str, bytes]:
-        """Receive the next available tensor from the transport queue.
-
-        Args:
-            timeout: Maximum seconds to wait before raising TimeoutError.
-
-        Returns:
-            Tuple of (sender_node_id, payload_bytes).
-        """
-        pass
-
-    def get_metrics(self) -> Dict[str, Any]:
-        """Return cumulative network transfer and latency metrics."""
-        avg_send_lat = (
-            sum(self.send_latencies_ms) / len(self.send_latencies_ms)
-            if self.send_latencies_ms
-            else 0.0
-        )
-        avg_recv_lat = (
-            sum(self.recv_latencies_ms) / len(self.recv_latencies_ms)
-            if self.recv_latencies_ms
-            else 0.0
-        )
-        return {
-            "node_id": self.node_id,
-            "transport_type": self.__class__.__name__,
-            "total_bytes_sent": self.total_bytes_sent,
-            "total_bytes_received": self.total_bytes_received,
-            "total_mb_sent": round(self.total_bytes_sent / (1024 * 1024), 2),
-            "total_mb_received": round(self.total_bytes_received / (1024 * 1024), 2),
-            "avg_send_latency_ms": round(avg_send_lat, 2),
-            "avg_recv_latency_ms": round(avg_recv_lat, 2),
-            "simulated_latency_ms": self.simulate_latency_ms,
-        }
-
-    async def _apply_simulated_latency(self) -> None:
-        """Simulate network latency if configured."""
-        if self.simulate_latency_ms > 0:
-            await asyncio.sleep(self.simulate_latency_ms / 1000.0)
-
-
-class DirectTCPTransport(Transport):
-    """Direct peer-to-peer TCP transport for LAN or high-speed private networks."""
-
-    def __init__(
-        self,
-        node_id: str,
-        host: str = "127.0.0.1",
-        port: int = 0,
-        simulate_latency_ms: float = 0.0,
-    ):
-        super().__init__(node_id=node_id, simulate_latency_ms=simulate_latency_ms)
-        self.host = host
-        self.port = port
-        self.listen_port = port
-        self._server: Optional[asyncio.Server] = None
-        self._inbox: asyncio.Queue[Tuple[str, bytes]] = asyncio.Queue()
-        self._peer_addresses: Dict[str, Tuple[str, int]] = {}
-        self._peer_connections: Dict[str, Tuple[asyncio.StreamReader, asyncio.StreamWriter]] = {}
-        self._incoming_writers: set[asyncio.StreamWriter] = set()
-
-    def register_peer(self, node_id: str, host: str, port: int) -> None:
-        """Register the network location of a peer node."""
-        self._peer_addresses[node_id] = (host, port)
-
-    async def start(self) -> None:
-        """Start listening on the TCP port."""
-        self._server = await asyncio.start_server(
-            self._handle_client,
-            self.host,
-            self.port,
-        )
-        # Capture the dynamically assigned port if 0 was given
-        sockets = self._server.sockets
-        if sockets:
-            self.listen_port = sockets[0].getsockname()[1]
-        self._running = True
-        logger.info(f"DirectTCPTransport [{self.node_id}] listening on {self.host}:{self.listen_port}")
-
-    async def _handle_client(
-        self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter
-    ) -> None:
-        """Handle incoming TCP connections from peer nodes."""
-        self._incoming_writers.add(writer)
-        try:
-            while self._running:
-                # Frame layout: [4-byte total length][4-byte sender_id len][sender_id][payload]
-                total_len_data = await reader.readexactly(UINT32_STRUCT.size)
-                (total_len,) = UINT32_STRUCT.unpack(total_len_data)
-
-                frame = await reader.readexactly(total_len)
-                (sender_len,) = UINT32_STRUCT.unpack_from(frame, 0)
-                sender_id = frame[UINT32_STRUCT.size : UINT32_STRUCT.size + sender_len].decode("utf-8")
-                payload = frame[UINT32_STRUCT.size + sender_len :]
-
-                t0 = time.perf_counter()
-                await self._apply_simulated_latency()
-                self.total_bytes_received += len(frame) + UINT32_STRUCT.size
-                elapsed_ms = (time.perf_counter() - t0) * 1000.0
-                self.recv_latencies_ms.append(elapsed_ms)
-
-                await self._inbox.put((sender_id, payload))
-        except (asyncio.IncompleteReadError, ConnectionResetError, BrokenPipeError):
-            pass
-        finally:
-            self._incoming_writers.discard(writer)
-            writer.close()
-            try:
-                await asyncio.wait_for(writer.wait_closed(), timeout=0.2)
-            except Exception:
-                pass
-
-    async def _get_or_create_connection(
-        self, target_node_id: str
-    ) -> Tuple[asyncio.StreamReader, asyncio.StreamWriter]:
-        """Obtain a reusable TCP connection to a peer, opening one if necessary."""
-        if target_node_id in self._peer_connections:
-            reader, writer = self._peer_connections[target_node_id]
-            if not writer.is_closing():
-                return reader, writer
-
-        if target_node_id not in self._peer_addresses:
-            raise KeyError(
-                f"Peer node '{target_node_id}' address unknown to DirectTCPTransport"
-            )
-
-        host, port = self._peer_addresses[target_node_id]
-        reader, writer = await asyncio.open_connection(host, port)
-        self._peer_connections[target_node_id] = (reader, writer)
-        return reader, writer
-
-    async def send_tensor(self, target_node_id: str, payload: bytes) -> None:
-        """Send a tensor frame to a peer via direct TCP socket."""
+    async def send(self, target_node_id: str, payload: bytes) -> None:
         t0 = time.perf_counter()
-        await self._apply_simulated_latency()
+        wire_bytes = await self._send_raw(target_node_id, payload)
+        self.send_time_ms += (time.perf_counter() - t0) * 1000.0
+        self.bytes_sent += wire_bytes
+        self.frames_sent += 1
 
-        sender_id_bytes = self.node_id.encode("utf-8")
-        sender_len = len(sender_id_bytes)
-        # Body = [4-byte sender_len][sender_id][payload]
-        body = UINT32_STRUCT.pack(sender_len) + sender_id_bytes + payload
-        total_len = len(body)
-        frame = UINT32_STRUCT.pack(total_len) + body
+    async def recv(self, timeout: Optional[float] = None) -> Tuple[str, bytes]:
+        """Wait for the next frame. Raises asyncio.TimeoutError on timeout."""
+        deliver_at, sender, payload = await asyncio.wait_for(self._inbox.get(), timeout)
+        wait = deliver_at - time.monotonic()
+        if wait > 0:  # simulated network latency
+            await asyncio.sleep(wait)
+        return sender, payload
 
-        reader, writer = await self._get_or_create_connection(target_node_id)
-        writer.write(frame)
-        await writer.drain()
+    # ----- helpers for subclasses -----------------------------------------
+    def _deliver(self, sender: str, payload: bytes, wire_bytes: int) -> None:
+        self.bytes_received += wire_bytes
+        self._inbox.put_nowait((time.monotonic() + self.simulate_latency_ms / 1000.0, sender, payload))
 
-        self.total_bytes_sent += len(frame)
-        elapsed_ms = (time.perf_counter() - t0) * 1000.0
-        self.send_latencies_ms.append(elapsed_ms)
+    def take_step_stats(self) -> Dict[str, float]:
+        """Return traffic since the previous call (used for per-step metrics)."""
+        s0, r0, f0, t0 = self._snap
+        stats = {
+            "bytes_sent": self.bytes_sent - s0,
+            "bytes_received": self.bytes_received - r0,
+            "frames_sent": self.frames_sent - f0,
+            "avg_send_ms": (self.send_time_ms - t0) / max(1, self.frames_sent - f0),
+        }
+        self._snap = (self.bytes_sent, self.bytes_received, self.frames_sent, self.send_time_ms)
+        return stats
 
-    async def receive_tensor(self, timeout: Optional[float] = None) -> Tuple[str, bytes]:
-        """Retrieve next tensor from the incoming TCP queue."""
-        if timeout is not None:
-            return await asyncio.wait_for(self._inbox.get(), timeout=timeout)
-        return await self._inbox.get()
+    def clear_inbox(self) -> None:
+        """Drop any queued frames (e.g. leftovers of a cancelled job)."""
+        while not self._inbox.empty():
+            self._inbox.get_nowait()
+
+
+# ---------------------------------------------------------------------------
+# Local (in-process) transport
+# ---------------------------------------------------------------------------
+class LocalHub:
+    """A fake network: a dict of node_id -> LocalTransport living in one process."""
+
+    def __init__(self):
+        self.nodes: Dict[str, "LocalTransport"] = {}
+
+
+class LocalTransport(Transport):
+    name = "local"
+
+    def __init__(self, node_id: str, hub: LocalHub, simulate_latency_ms: float = 0.0):
+        super().__init__(node_id, simulate_latency_ms)
+        self.hub = hub
+
+    async def start(self) -> None:
+        self.hub.nodes[self.node_id] = self
 
     async def stop(self) -> None:
-        """Close listening server and all peer TCP connections."""
-        self._running = False
-        if self._server:
-            self._server.close()
-            try:
-                await asyncio.wait_for(self._server.wait_closed(), timeout=0.5)
-            except Exception:
-                pass
+        self.hub.nodes.pop(self.node_id, None)
 
-        for writer in list(self._incoming_writers):
-            try:
-                writer.close()
-            except Exception:
-                pass
-        self._incoming_writers.clear()
-
-        for target_id, (_, writer) in list(self._peer_connections.items()):
-            try:
-                writer.close()
-                await asyncio.wait_for(writer.wait_closed(), timeout=0.5)
-            except Exception:
-                pass
-        self._peer_connections.clear()
+    async def _send_raw(self, target_node_id: str, payload: bytes) -> int:
+        target = self.hub.nodes.get(target_node_id)
+        if target is None:
+            raise ConnectionError(f"Local node '{target_node_id}' not found")
+        target._deliver(self.node_id, payload, len(payload))
+        return len(payload)
 
 
-class RelayTransport(Transport):
-    """Outbound WebSocket transport routing tensors through the Coordinator.
+# ---------------------------------------------------------------------------
+# Direct TCP transport
+# ---------------------------------------------------------------------------
+class DirectTCPTransport(Transport):
+    """Point-to-point TCP. Each frame: [4B length][4B id-len][sender id][payload].
 
-    Works automatically behind student routers, NATs, and campus firewalls without
-    port forwarding or static IP addresses.
+    The first frame on every new connection is a handshake carrying the room's
+    shared `tcp_secret` (given to members by the coordinator). Connections that
+    don't present it are closed, so strangers on the LAN can't inject tensors.
     """
 
+    name = "tcp"
+
     def __init__(
         self,
         node_id: str,
-        relay_url: str,
-        room_code: str,
+        listen_host: str = "0.0.0.0",
+        port: int = 0,
+        secret: str = "",
         simulate_latency_ms: float = 0.0,
     ):
-        super().__init__(node_id=node_id, simulate_latency_ms=simulate_latency_ms)
-        self.relay_url = relay_url
-        self.room_code = room_code
-        self._ws: Optional[websockets.WebSocketClientProtocol] = None
-        self._inbox: asyncio.Queue[Tuple[str, bytes]] = asyncio.Queue()
-        self._receive_task: Optional[asyncio.Task] = None
+        super().__init__(node_id, simulate_latency_ms)
+        self.listen_host = listen_host
+        self.port = port
+        self.secret = secret
+        self._server: Optional[asyncio.base_events.Server] = None
+        self._peers: Dict[str, Tuple[str, int]] = {}
+        self._writers: Dict[str, asyncio.StreamWriter] = {}
+        self._incoming: set = set()
+        self._send_lock = asyncio.Lock()
+
+    def register_peer(self, node_id: str, host: str, port: int) -> None:
+        if self._peers.get(node_id) != (host, port):
+            self._peers[node_id] = (host, port)
+            old = self._writers.pop(node_id, None)
+            if old:
+                old.close()
 
     async def start(self) -> None:
-        """Establish outbound WebSocket connection to coordinator relay endpoint."""
-        # Convert http/https URL scheme to ws/wss if needed
-        ws_url = self.relay_url
-        if ws_url.startswith("http://"):
-            ws_url = "ws://" + ws_url[7:]
-        elif ws_url.startswith("https://"):
-            ws_url = "wss://" + ws_url[8:]
-
-        # Endpoint convention: /ws/relay/{room_code}/{node_id}
-        full_url = f"{ws_url.rstrip('/')}/ws/relay/{self.room_code}/{self.node_id}"
-        # Set max_size=100MB to easily accommodate large tensor frames
-        self._ws = await websockets.connect(full_url, max_size=100 * 1024 * 1024)
-        self._running = True
-        self._receive_task = asyncio.create_task(self._listen_loop())
-        logger.info(f"RelayTransport [{self.node_id}] connected to coordinator at {full_url}")
-
-    async def _listen_loop(self) -> None:
-        """Receive routed binary frames forwarded by the coordinator."""
-        try:
-            while self._running and self._ws is not None:
-                message = await self._ws.recv()
-                if not isinstance(message, bytes):
-                    continue
-
-                t0 = time.perf_counter()
-                await self._apply_simulated_latency()
-                # Incoming frame from coordinator: [4-byte sender_id len][sender_id][payload]
-                if len(message) < UINT32_STRUCT.size:
-                    continue
-                (sender_len,) = UINT32_STRUCT.unpack_from(message, 0)
-                sender_id = message[UINT32_STRUCT.size : UINT32_STRUCT.size + sender_len].decode("utf-8")
-                payload = message[UINT32_STRUCT.size + sender_len :]
-
-                self.total_bytes_received += len(message)
-                elapsed_ms = (time.perf_counter() - t0) * 1000.0
-                self.recv_latencies_ms.append(elapsed_ms)
-
-                await self._inbox.put((sender_id, payload))
-        except (websockets.ConnectionClosed, asyncio.CancelledError):
-            pass
-
-    async def send_tensor(self, target_node_id: str, payload: bytes) -> None:
-        """Send tensor frame to coordinator with target node routing envelope."""
-        if not self._ws or not self._running:
-            raise ConnectionError(f"RelayTransport [{self.node_id}] is not connected")
-
-        t0 = time.perf_counter()
-        await self._apply_simulated_latency()
-
-        # Outbound frame: [4-byte target_id len][target_id][payload]
-        target_bytes = target_node_id.encode("utf-8")
-        target_len = len(target_bytes)
-        envelope = UINT32_STRUCT.pack(target_len) + target_bytes + payload
-
-        await self._ws.send(envelope)
-
-        self.total_bytes_sent += len(envelope)
-        elapsed_ms = (time.perf_counter() - t0) * 1000.0
-        self.send_latencies_ms.append(elapsed_ms)
-
-    async def receive_tensor(self, timeout: Optional[float] = None) -> Tuple[str, bytes]:
-        """Retrieve next routed tensor from inbox queue."""
-        if timeout is not None:
-            return await asyncio.wait_for(self._inbox.get(), timeout=timeout)
-        return await self._inbox.get()
+        self._server = await asyncio.start_server(self._handle_conn, self.listen_host, self.port)
+        self.port = self._server.sockets[0].getsockname()[1]
+        logger.info("TCP transport %s listening on %s:%d", self.node_id, self.listen_host, self.port)
 
     async def stop(self) -> None:
-        """Gracefully disconnect from coordinator relay."""
-        self._running = False
-        if self._receive_task:
-            self._receive_task.cancel()
+        if self._server:
+            self._server.close()
+        for w in list(self._writers.values()) + list(self._incoming):
+            w.close()
+        self._writers.clear()
+        self._incoming.clear()
+
+    @staticmethod
+    async def _read_frame(reader: asyncio.StreamReader) -> bytes:
+        (n,) = UINT32.unpack(await reader.readexactly(UINT32.size))
+        if n > MAX_FRAME_BYTES:
+            raise ValueError("TCP frame too large")
+        return await reader.readexactly(n)
+
+    async def _handle_conn(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
+        self._incoming.add(writer)
+        try:
+            hello = await asyncio.wait_for(self._read_frame(reader), timeout=5.0)
+            sender, secret = _unpack_id(hello)
+            if not hmac.compare_digest(bytes(secret), self.secret.encode("utf-8")):
+                logger.warning("Rejected TCP connection with bad secret (claimed id %s)", sender)
+                return
+            while True:
+                frame = await self._read_frame(reader)
+                frame_sender, payload = _unpack_id(frame)
+                self._deliver(frame_sender, payload, len(frame) + UINT32.size)
+        except (asyncio.IncompleteReadError, ConnectionError, asyncio.TimeoutError, ValueError):
+            pass
+        finally:
+            self._incoming.discard(writer)
+            writer.close()
+
+    async def _connect(self, target: str) -> asyncio.StreamWriter:
+        if target not in self._peers:
+            raise ConnectionError(f"No TCP address known for peer '{target}'")
+        host, port = self._peers[target]
+        _, writer = await asyncio.wait_for(asyncio.open_connection(host, port), timeout=10.0)
+        hello = _pack_id(self.node_id) + self.secret.encode("utf-8")
+        writer.write(UINT32.pack(len(hello)) + hello)
+        self._writers[target] = writer
+        return writer
+
+    async def _send_raw(self, target_node_id: str, payload: bytes) -> int:
+        body = _pack_id(self.node_id) + payload
+        frame = UINT32.pack(len(body)) + body
+        async with self._send_lock:  # keep frames from interleaving on one socket
+            for attempt in range(2):  # one retry with a fresh connection
+                writer = self._writers.get(target_node_id)
+                try:
+                    if writer is None or writer.is_closing():
+                        writer = await self._connect(target_node_id)
+                    writer.write(frame)
+                    await writer.drain()
+                    return len(frame)
+                except (ConnectionError, OSError):
+                    self._writers.pop(target_node_id, None)
+                    if attempt == 1:
+                        raise
+        return 0
+
+
+# ---------------------------------------------------------------------------
+# Relay transport (through the coordinator)
+# ---------------------------------------------------------------------------
+class RelayTransport(Transport):
+    """Binary WebSocket to the coordinator at /ws/relay/{room}/{node}?token=...
+
+    Outgoing message: [4B target-id-len][target id][frame]
+    Incoming message: [4B sender-id-len][sender id][frame]
+
+    The connection is kept open for the agent's whole life and is re-opened
+    automatically if it drops (sends wait until it is back).
+    """
+
+    name = "relay"
+
+    def __init__(
+        self,
+        node_id: str,
+        server_url: str,
+        room_code: str,
+        token: str,
+        simulate_latency_ms: float = 0.0,
+    ):
+        super().__init__(node_id, simulate_latency_ms)
+        base = server_url.rstrip("/").replace("https://", "wss://", 1).replace("http://", "ws://", 1)
+        self.url = f"{base}/ws/relay/{room_code}/{node_id}?token={token}"
+        self._ws = None
+        self._connected = asyncio.Event()
+        self._task: Optional[asyncio.Task] = None
+        self._stopping = False
+
+    async def start(self) -> None:
+        self._stopping = False
+        self._task = asyncio.create_task(self._run())
+        await asyncio.wait_for(self._connected.wait(), timeout=15.0)
+
+    async def _run(self) -> None:
+        import websockets
+
+        backoff = 0.5
+        while not self._stopping:
             try:
-                await self._receive_task
+                async with websockets.connect(self.url, max_size=MAX_FRAME_BYTES, ping_interval=20) as ws:
+                    self._ws = ws
+                    self._connected.set()
+                    backoff = 0.5
+                    async for msg in ws:
+                        if isinstance(msg, (bytes, bytearray)):
+                            try:
+                                sender, payload = _unpack_id(msg)
+                            except ValueError:
+                                continue
+                            self._deliver(sender, payload, len(msg))
             except asyncio.CancelledError:
-                pass
-        if self._ws:
+                raise
+            except Exception as exc:  # network trouble -> retry with backoff
+                if not self._stopping:
+                    logger.warning("Relay connection lost (%s); retrying in %.1fs", exc, backoff)
+            finally:
+                self._ws = None
+                self._connected.clear()
+            if not self._stopping:
+                await asyncio.sleep(backoff)
+                backoff = min(backoff * 2, 10.0)
+
+    async def stop(self) -> None:
+        self._stopping = True
+        if self._ws is not None:
             await self._ws.close()
-            self._ws = None
+        if self._task:
+            self._task.cancel()
+            try:
+                await self._task
+            except (asyncio.CancelledError, Exception):
+                pass
+
+    async def _send_raw(self, target_node_id: str, payload: bytes) -> int:
+        await asyncio.wait_for(self._connected.wait(), timeout=60.0)
+        envelope = _pack_id(target_node_id) + payload
+        await self._ws.send(envelope)
+        return len(envelope)

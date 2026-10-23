@@ -1,251 +1,286 @@
-"""PoolForge Distributed Pipeline Parallelism Execution Engine.
+"""Pipeline-parallel training engine (the core of PoolForge).
 
-Implements the forward/backward autograd splitting trick across N nodes:
-- Stage 0 (first): computes out = stage(x), detaches, forwards out + labels to Stage 1.
-- Stage 1..(N-2) (middle): receives activation, sets requires_grad_(), forwards out to next.
-- Stage (N-1) (last): receives activation, computes loss, calls loss.backward(), sends grad backward.
-- Middle stages receive grad, call out.backward(grad), and propagate grad backward.
-- Each stage updates its own parameters with its own local optimizer.
-- Supports micro-batching and stage checkpointing.
+The model's layers are cut into contiguous stages; stage i runs on node i.
+One training step with M micro-batches works like this (GPipe schedule):
+
+  FORWARD, for each micro-batch m:
+    first stage : out = layers(x_m)          -> send out.detach() + labels to next
+    middle stage: inp = recv().requires_grad_(); out = layers(inp) -> send to next
+    last stage  : inp = recv().requires_grad_(); loss = CE(layers(inp), labels)
+
+  BACKWARD, for each micro-batch m:
+    last stage  : loss.backward()             -> send inp.grad to previous
+    middle stage: g = recv(); out.backward(g) -> send inp.grad to previous
+    first stage : g = recv(); out.backward(g)
+
+  Finally every stage calls optimizer.step() on its OWN parameters.
+
+The "autograd trick": `detach()` cuts the graph at the network boundary and
+`requires_grad_()` on the received tensor starts a new graph, so after
+backward() the receiver's `inp.grad` is exactly dLoss/d(activation), which is
+what the previous stage needs to continue backprop with out.backward(grad).
+
+With M > 1, stage 0 can start micro-batch 1 while stage 1 still works on
+micro-batch 0, which hides some network latency (when stages run on
+different machines/processes).
 """
 
-import os
+import asyncio
+import logging
+import time
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, Iterator, List, Optional, Tuple
+
 import torch
 import torch.nn as nn
-from common.models import build_layers
-from common.protocol import serialize_tensor, deserialize_tensor
-from common.transports import Transport
+
+from common.models import build_layers, make_optimizer
+from common.protocol import deserialize_tensor, serialize_tensor
+from common.transports import LocalHub, LocalTransport, Transport
+
+logger = logging.getLogger("poolforge.pipeline")
+
+
+class Mailbox:
+    """Receives frames and hands them out by (kind, step, microbatch).
+
+    Frames may arrive in any order (e.g. labels before activations, or a
+    gradient for micro-batch 1 before micro-batch 0). Frames are stored until
+    someone asks for exactly that key. Frames of other jobs are ignored.
+    """
+
+    def __init__(self, transport: Transport, job_id: str, decrypt_key: Optional[bytes] = None):
+        self.transport = transport
+        self.job_id = job_id
+        self.decrypt_key = decrypt_key
+        self._stash: Dict[Tuple[str, int, int], torch.Tensor] = {}
+
+    async def get(self, kind: str, step: int, mb: int) -> torch.Tensor:
+        key = (kind, step, mb)
+        while key not in self._stash:
+            _sender, frame = await self.transport.recv()
+            try:
+                tensor, hdr = deserialize_tensor(frame, self.decrypt_key)
+            except Exception as exc:  # corrupt / wrong key: log and ignore the frame
+                logger.warning("Dropping bad frame: %s", exc)
+                continue
+            if hdr["job_id"] != self.job_id:
+                continue  # leftover from an older job
+            self._stash[(hdr["kind"], hdr["step"], hdr["microbatch"])] = tensor
+        return self._stash.pop(key)
+
+    def forget_before(self, step: int) -> None:
+        """Drop stashed frames of old steps (after a resume from checkpoint)."""
+        for k in [k for k in self._stash if k[1] < step]:
+            del self._stash[k]
 
 
 class PipelineStage:
-    """Manages the execution of a contiguous layer slice on a worker node."""
+    """One node's slice of the model plus its optimizer and network links."""
 
     def __init__(
         self,
-        stage_index: int,
-        num_stages: int,
-        layer_specs: List[Dict[str, Any]],
+        specs: List[Dict[str, Any]],
         start_layer: int,
         end_layer: int,
+        stage_index: int,
+        num_stages: int,
         transport: Transport,
-        prev_node_id: Optional[str] = None,
-        next_node_id: Optional[str] = None,
-        learning_rate: float = 0.01,
-        optimizer_type: str = "sgd",
-        job_id: str = "job_default",
+        prev_node: Optional[str],
+        next_node: Optional[str],
+        job_id: str,
+        lr: float = 1e-3,
+        optimizer: str = "adam",
+        seed: int = 0,
+        encrypt_key: Optional[bytes] = None,
         checkpoint_dir: str = "./checkpoints",
     ):
         self.stage_index = stage_index
         self.num_stages = num_stages
-        self.start_layer = start_layer
-        self.end_layer = end_layer
+        self.is_first = stage_index == 0
+        self.is_last = stage_index == num_stages - 1
+        self.start_layer, self.end_layer = start_layer, end_layer
         self.transport = transport
-        self.prev_node_id = prev_node_id
-        self.next_node_id = next_node_id
+        self.prev_node, self.next_node = prev_node, next_node
         self.job_id = job_id
-        self.checkpoint_dir = Path(checkpoint_dir)
-        self.checkpoint_dir.mkdir(parents=True, exist_ok=True)
+        self.key = encrypt_key
+        self.mailbox = Mailbox(transport, job_id, encrypt_key)
+        self.checkpoint_dir = Path(checkpoint_dir) / job_id
 
-        # Determine stage role
-        self.is_first = (stage_index == 0)
-        self.is_last = (stage_index == num_stages - 1)
+        # Build ONLY this stage's layers. The full model never exists on one node.
+        self.layers: nn.Sequential = build_layers(specs, start_layer, end_layer, seed=seed)
+        self.optimizer = make_optimizer(self.layers.parameters(), optimizer, lr)
+        self.loss_fn = nn.CrossEntropyLoss()
 
-        # Build ONLY assigned layers
-        self.layers: nn.Sequential = build_layers(layer_specs, start_layer, end_layer)
+    def num_params(self) -> int:
+        return sum(p.numel() for p in self.layers.parameters())
 
-        # Local optimizer
-        params = list(self.layers.parameters())
-        if optimizer_type.lower() == "adam":
-            self.optimizer = torch.optim.Adam(params, lr=learning_rate) if params else None
-        else:
-            self.optimizer = torch.optim.SGD(params, lr=learning_rate) if params else None
+    async def _send(self, target: str, tensor: torch.Tensor, kind: str, step: int, mb: int) -> None:
+        frame = serialize_tensor(tensor, kind=kind, job_id=self.job_id, step=step, microbatch=mb, encrypt_key=self.key)
+        await self.transport.send(target, frame)
 
-        self.loss_fn = nn.CrossEntropyLoss() if self.is_last else None
-
-        # Activation and gradient caches for autograd linking across microbatches
-        # Key: microbatch_index -> cache
-        self._cached_inputs: Dict[int, torch.Tensor] = {}
-        self._cached_outputs: Dict[int, torch.Tensor] = {}
-        self._cached_labels: Dict[int, torch.Tensor] = {}
-
-    def zero_grad(self) -> None:
-        """Clear gradients on local parameters."""
+    async def train_step(
+        self,
+        step: int,
+        x: Optional[torch.Tensor] = None,
+        y: Optional[torch.Tensor] = None,
+        microbatches: int = 1,
+    ) -> Optional[float]:
+        """Run one full training step. Returns the loss on the last stage, else None."""
+        self.layers.train()
         if self.optimizer:
             self.optimizer.zero_grad()
 
-    def step_optimizer(self) -> None:
-        """Perform optimizer parameter update on local layers."""
-        if self.optimizer:
-            self.optimizer.step()
+        xs = torch.chunk(x, microbatches) if self.is_first else [None] * microbatches
+        ys = torch.chunk(y, microbatches) if self.is_first else [None] * microbatches
+        if self.is_first and len(xs) != microbatches:
+            raise ValueError("batch_size must be >= microbatches")
 
-    async def forward_step(
-        self,
-        x: Optional[torch.Tensor] = None,
-        labels: Optional[torch.Tensor] = None,
-        step: int = 0,
-        microbatch: int = 0,
-        timeout: float = 10.0,
-    ) -> Optional[float]:
-        """Execute forward pass for one microbatch.
+        saved: List[Tuple[Optional[torch.Tensor], torch.Tensor]] = []  # (input, output-or-loss)
+        total_loss = 0.0
 
-        Returns loss float on the last stage; None on non-last stages.
-        """
-        if self.is_first:
-            if x is None:
-                raise ValueError("Stage 0 requires input tensor x")
-
-            out = self.layers(x)
-            self._cached_outputs[microbatch] = out
-
-            if not self.is_last:
-                # Forward activation to next node
-                act_payload = serialize_tensor(
-                    out,
-                    kind="activation",
-                    job_id=self.job_id,
-                    step=step,
-                    microbatch=microbatch,
-                )
-                await self.transport.send_tensor(self.next_node_id, act_payload)
-
-                # Send labels along so only the last stage needs them
-                if labels is not None:
-                    label_payload = serialize_tensor(
-                        labels,
-                        kind="labels",
-                        job_id=self.job_id,
-                        step=step,
-                        microbatch=microbatch,
-                    )
-                    await self.transport.send_tensor(self.next_node_id, label_payload)
+        # ---------------- forward pass for every micro-batch ----------------
+        for m in range(microbatches):
+            if self.is_first:
+                inp, labels = None, ys[m]
+                out = self.layers(xs[m])
             else:
-                # Single-node pipeline case
-                if labels is None:
-                    raise ValueError("Single stage pipeline requires labels")
-                loss = self.loss_fn(out, labels)
-                return loss.item()
-
-            return None
-
-        else:
-            # Middle or last stage: receive activation from previous node
-            sender, act_bytes = await self.transport.receive_tensor(timeout=timeout)
-            act_tensor, act_hdr = deserialize_tensor(act_bytes)
-
-            # If middle stage forwarding labels to next, or last stage receiving labels
-            received_labels = None
-            if self.is_last or self.next_node_id:
-                sender, lbl_bytes = await self.transport.receive_tensor(timeout=timeout)
-                lbl_tensor, _ = deserialize_tensor(lbl_bytes)
-                received_labels = lbl_tensor
-
-            # Autograd hook: requires_grad_() allows gradients to flow back into this tensor
-            inp = act_tensor.detach().clone().requires_grad_()
-            self._cached_inputs[microbatch] = inp
-
-            out = self.layers(inp)
-            self._cached_outputs[microbatch] = out
+                inp = (await self.mailbox.get("activation", step, m)).requires_grad_()
+                labels = await self.mailbox.get("labels", step, m)
+                out = self.layers(inp)
 
             if self.is_last:
-                self._cached_labels[microbatch] = received_labels
-                loss = self.loss_fn(out, received_labels)
-                return loss.item()
+                # Divide by M so the summed gradients equal those of the full batch.
+                loss = self.loss_fn(out, labels) / microbatches
+                total_loss += loss.item()
+                saved.append((inp, loss))
             else:
-                # Middle stage: forward activation and labels to next node
-                act_payload = serialize_tensor(
-                    out,
-                    kind="activation",
-                    job_id=self.job_id,
-                    step=step,
-                    microbatch=microbatch,
-                )
-                await self.transport.send_tensor(self.next_node_id, act_payload)
+                await self._send(self.next_node, out.detach(), "activation", step, m)
+                await self._send(self.next_node, labels, "labels", step, m)
+                saved.append((inp, out))
 
-                if received_labels is not None:
-                    lbl_payload = serialize_tensor(
-                        received_labels,
-                        kind="labels",
-                        job_id=self.job_id,
-                        step=step,
-                        microbatch=microbatch,
-                    )
-                    await self.transport.send_tensor(self.next_node_id, lbl_payload)
-                return None
-
-    async def backward_step(
-        self,
-        step: int = 0,
-        microbatch: int = 0,
-        loss_scale: float = 1.0,
-        timeout: float = 10.0,
-    ) -> None:
-        """Execute backward pass for one microbatch.
-
-        Propagates gradients sequentially from last stage back to first stage.
-        """
-        if self.is_last:
-            out = self._cached_outputs.pop(microbatch)
-            labels = self._cached_labels.pop(microbatch)
-            inp = self._cached_inputs.pop(microbatch, None)
-
-            # Scaled loss for microbatch gradient accumulation
-            loss = self.loss_fn(out, labels) * loss_scale
-            loss.backward()
-
-            if not self.is_first and inp is not None and inp.grad is not None:
-                # Send activation gradients back to previous stage
-                grad_payload = serialize_tensor(
-                    inp.grad,
-                    kind="gradient",
-                    job_id=self.job_id,
-                    step=step,
-                    microbatch=microbatch,
-                )
-                await self.transport.send_tensor(self.prev_node_id, grad_payload)
-
-        else:
-            # Middle or first stage: receive incoming gradient from downstream stage
-            sender, grad_bytes = await self.transport.receive_tensor(timeout=timeout)
-            grad_tensor, _ = deserialize_tensor(grad_bytes)
-
-            out = self._cached_outputs.pop(microbatch)
-            out.backward(grad_tensor)
-
+        # ---------------- backward pass for every micro-batch ---------------
+        for m in range(microbatches):
+            inp, out = saved[m]
+            if self.is_last:
+                out.backward()  # `out` is the loss here
+            else:
+                grad = await self.mailbox.get("gradient", step, m)
+                if out.requires_grad:  # False only for a first stage with no weights
+                    out.backward(grad)
             if not self.is_first:
-                # Middle stage: send upstream gradient to previous stage
-                inp = self._cached_inputs.pop(microbatch)
-                if inp.grad is not None:
-                    grad_payload = serialize_tensor(
-                        inp.grad,
-                        kind="gradient",
-                        job_id=self.job_id,
-                        step=step,
-                        microbatch=microbatch,
-                    )
-                    await self.transport.send_tensor(self.prev_node_id, grad_payload)
+                await self._send(self.prev_node, inp.grad, "gradient", step, m)
 
-    def save_checkpoint(self, step: int) -> str:
-        """Save local stage parameters and optimizer state to disk."""
-        filename = f"{self.job_id}_stage_{self.stage_index}_step_{step}.pt"
-        filepath = self.checkpoint_dir / filename
-        state = {
-            "step": step,
-            "stage_index": self.stage_index,
-            "num_stages": self.num_stages,
-            "start_layer": self.start_layer,
-            "end_layer": self.end_layer,
-            "model_state": self.layers.state_dict(),
-            "optimizer_state": self.optimizer.state_dict() if self.optimizer else None,
-        }
-        torch.save(state, str(filepath))
-        return str(filepath)
+        if self.optimizer:
+            self.optimizer.step()
+        return total_loss if self.is_last else None
 
-    def load_checkpoint(self, filepath: str) -> int:
-        """Load stage parameters from a checkpoint file and return the saved step."""
-        state = torch.load(filepath, map_location="cpu")
-        self.layers.load_state_dict(state["model_state"])
-        if self.optimizer and state.get("optimizer_state"):
-            self.optimizer.load_state_dict(state["optimizer_state"])
-        return state.get("step", 0)
+    # ------------------------------ checkpoints ------------------------------
+    def checkpoint_path(self, step: int) -> Path:
+        return self.checkpoint_dir / f"stage{self.stage_index}_step{step}.pt"
+
+    def save_checkpoint(self, step: int, keep: int = 3) -> Path:
+        """Save weights + optimizer state after `step` completed steps."""
+        self.checkpoint_dir.mkdir(parents=True, exist_ok=True)
+        path = self.checkpoint_path(step)
+        torch.save(
+            {
+                "step": step,
+                "layers": [self.start_layer, self.end_layer],
+                "model": self.layers.state_dict(),
+                "optimizer": self.optimizer.state_dict() if self.optimizer else None,
+            },
+            path,
+        )
+        # keep only the newest few files
+        old = sorted(self.checkpoint_dir.glob(f"stage{self.stage_index}_step*.pt"), key=lambda p: p.stat().st_mtime)
+        for p in old[:-keep]:
+            p.unlink(missing_ok=True)
+        return path
+
+    def load_checkpoint(self, step: int) -> bool:
+        """Load the checkpoint for `step` if it exists and matches our layers."""
+        path = self.checkpoint_path(step)
+        if not path.exists():
+            return False
+        # weights_only=True: only tensors/numbers are loaded, never arbitrary objects.
+        state = torch.load(path, map_location="cpu", weights_only=True)
+        if list(state["layers"]) != [self.start_layer, self.end_layer]:
+            return False
+        self.layers.load_state_dict(state["model"])
+        if self.optimizer and state["optimizer"]:
+            self.optimizer.load_state_dict(state["optimizer"])
+        return True
+
+
+# ---------------------------------------------------------------------------
+# Reference implementations used by tests and benchmarks
+# ---------------------------------------------------------------------------
+def train_single_process(
+    specs: List[Dict[str, Any]],
+    batches: Iterator[Tuple[torch.Tensor, torch.Tensor]],
+    steps: int,
+    lr: float = 1e-3,
+    optimizer: str = "adam",
+    seed: int = 0,
+) -> List[float]:
+    """Ordinary training of the whole model in one process (the baseline)."""
+    model = build_layers(specs, 0, len(specs), seed=seed)
+    opt = make_optimizer(model.parameters(), optimizer, lr)
+    loss_fn = nn.CrossEntropyLoss()
+    losses = []
+    for _ in range(steps):
+        x, y = next(batches)
+        opt.zero_grad()
+        loss = loss_fn(model(x), y)
+        loss.backward()
+        opt.step()
+        losses.append(loss.item())
+    return losses
+
+
+def even_split(num_layers: int, num_stages: int) -> List[Tuple[int, int]]:
+    """Cut num_layers into num_stages contiguous, roughly equal ranges."""
+    bounds = [round(i * num_layers / num_stages) for i in range(num_stages + 1)]
+    return [(bounds[i], bounds[i + 1]) for i in range(num_stages)]
+
+
+async def train_split_locally(
+    specs: List[Dict[str, Any]],
+    batches: Iterator[Tuple[torch.Tensor, torch.Tensor]],
+    steps: int,
+    ranges: List[Tuple[int, int]],
+    microbatches: int = 1,
+    lr: float = 1e-3,
+    optimizer: str = "adam",
+    seed: int = 0,
+    latency_ms: float = 0.0,
+) -> Tuple[List[float], float]:
+    """Run an N-stage pipeline inside one process over LocalTransport.
+
+    Returns (losses, seconds). Used by the loss-equivalence test.
+    """
+    hub = LocalHub()
+    n = len(ranges)
+    ids = [f"stage{i}" for i in range(n)]
+    stages = []
+    for i, (s, e) in enumerate(ranges):
+        t = LocalTransport(ids[i], hub, simulate_latency_ms=latency_ms)
+        await t.start()
+        stages.append(
+            PipelineStage(
+                specs, s, e, i, n, t,
+                prev_node=ids[i - 1] if i > 0 else None,
+                next_node=ids[i + 1] if i < n - 1 else None,
+                job_id="local", lr=lr, optimizer=optimizer, seed=seed,
+            )
+        )
+    losses = []
+    t0 = time.perf_counter()
+    for step in range(steps):
+        x, y = next(batches)
+        results = await asyncio.gather(
+            *[st.train_step(step, x if st.is_first else None, y if st.is_first else None, microbatches) for st in stages]
+        )
+        losses.append(results[-1])
+    return losses, time.perf_counter() - t0

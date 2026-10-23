@@ -1,199 +1,132 @@
-"""Phase 1 Tests: Tensor wire format, serialization, and transports.
-
-Acceptance criteria:
-- Bit-exact round trip for PyTorch tensors.
-- Large 50MB tensor serialized and deserialized without corruption.
-- DirectTCP transport delivery across local nodes.
-- Relay transport routing with binary WebSocket frames.
-"""
+"""Phase 1: tensor wire format + transports (bit-exact round trips, 50 MB tensor)."""
 
 import asyncio
-import struct
+import time
+
 import pytest
 import torch
-import websockets
 
-from common.protocol import serialize_tensor, deserialize_tensor, UINT32_STRUCT
-from common.transports import DirectTCPTransport, RelayTransport
-
-
-def test_bit_exact_roundtrip_various_types():
-    """Verify serialization and deserialization is bit-exact across shapes and dtypes."""
-    # Test cases: (tensor, kind, step, microbatch)
-    test_cases = [
-        (torch.randn(10, 20, dtype=torch.float32), "activation", 1, 0),
-        (torch.randn(5, 5, 5, dtype=torch.float64), "gradient", 2, 1),
-        (torch.randint(0, 100, (64,), dtype=torch.int64), "labels", 3, 0),
-        (torch.randint(-50, 50, (4, 8), dtype=torch.int32), "activation", 4, 2),
-        (torch.tensor([True, False, True, True], dtype=torch.bool), "metadata", 5, 0),
-    ]
-
-    for orig_tensor, kind, step, microbatch in test_cases:
-        extra_meta = {"sample_tag": "test_tag", "val": 42}
-        payload = serialize_tensor(
-            orig_tensor,
-            kind=kind,
-            job_id="job-phase1-test",
-            step=step,
-            microbatch=microbatch,
-            extra=extra_meta,
-        )
-
-        assert isinstance(payload, bytes)
-        assert len(payload) > 4
-
-        rebuilt_tensor, header = deserialize_tensor(payload)
-
-        # 1. Structural checks
-        assert header["kind"] == kind
-        assert header["job_id"] == "job-phase1-test"
-        assert header["step"] == step
-        assert header["microbatch"] == microbatch
-        assert header["extra"] == extra_meta
-        assert header["shape"] == list(orig_tensor.shape)
-
-        # 2. Bit-exact equality check
-        assert rebuilt_tensor.dtype == orig_tensor.dtype
-        assert rebuilt_tensor.shape == orig_tensor.shape
-        assert torch.equal(orig_tensor, rebuilt_tensor), "Tensor data corrupted during roundtrip!"
+from common.protocol import UINT32, deserialize_tensor, serialize_tensor
+from common.transports import DirectTCPTransport, LocalHub, LocalTransport
 
 
-def test_large_50mb_tensor_roundtrip():
-    """Verify a large 50 MB tensor serializes and rebuilds bit-exactly."""
-    # 50 MB = 50 * 1024 * 1024 bytes = 52,428,800 bytes
-    # Float32 is 4 bytes, so 13,107,200 elements
-    elements = 13_107_200
-    tensor_50mb = torch.randn(elements, dtype=torch.float32)
-    raw_size_mb = (tensor_50mb.numel() * tensor_50mb.element_size()) / (1024 * 1024)
-    assert abs(raw_size_mb - 50.0) < 0.1
-
-    payload = serialize_tensor(tensor_50mb, kind="activation", job_id="benchmark-50mb")
-    assert len(payload) > 52_428_800  # Raw bytes + header
-
-    rebuilt_tensor, header = deserialize_tensor(payload)
-    assert header["job_id"] == "benchmark-50mb"
-    assert rebuilt_tensor.shape == tensor_50mb.shape
-    assert torch.equal(tensor_50mb, rebuilt_tensor), "50MB tensor roundtrip failed bit-exact equality!"
+@pytest.mark.parametrize(
+    "dtype", [torch.float32, torch.float64, torch.float16, torch.bfloat16, torch.int64, torch.uint8, torch.bool]
+)
+def test_round_trip_is_bit_exact(dtype):
+    torch.manual_seed(0)
+    t = (torch.randn(3, 5, 7) * 100).to(dtype)
+    frame = serialize_tensor(t, kind="gradient", job_id="j1", step=4, microbatch=2)
+    out, header = deserialize_tensor(frame)
+    assert out.dtype == dtype and out.shape == t.shape
+    assert torch.equal(out.view(torch.uint8), t.view(torch.uint8))  # same bits
+    assert header["kind"] == "gradient" and header["step"] == 4 and header["microbatch"] == 2
 
 
-@pytest.mark.asyncio
-async def test_direct_tcp_transport():
-    """Verify direct peer-to-peer TCP transport delivers tensors reliably."""
-    node_a = DirectTCPTransport(node_id="node-a", host="127.0.0.1", port=0)
-    node_b = DirectTCPTransport(node_id="node-b", host="127.0.0.1", port=0)
+def test_frame_layout_matches_spec():
+    frame = serialize_tensor(torch.zeros(2, 2), job_id="x")
+    (hlen,) = UINT32.unpack_from(frame, 0)
+    assert len(frame) == 4 + hlen + 16  # 4 floats of 4 bytes
 
-    await node_a.start()
-    await node_b.start()
 
+def test_non_contiguous_and_scalar_tensors():
+    t = torch.arange(12.0).reshape(3, 4).t()  # transposed -> non-contiguous
+    out, _ = deserialize_tensor(serialize_tensor(t))
+    assert torch.equal(out, t)
+    out, _ = deserialize_tensor(serialize_tensor(torch.tensor(3.5)))
+    assert out.item() == 3.5 and out.shape == ()
+
+
+def test_rejects_corrupt_frames():
+    frame = serialize_tensor(torch.ones(4))
+    with pytest.raises(ValueError):
+        deserialize_tensor(frame[:-1])  # truncated payload
+    with pytest.raises(ValueError):
+        deserialize_tensor(b"\x00\x00")  # too short
+    bad = UINT32.pack(2) + b"{}"
+    with pytest.raises(ValueError):
+        deserialize_tensor(bad)  # missing fields
+    with pytest.raises(ValueError):
+        serialize_tensor(torch.ones(1), kind="pickle_me")
+
+
+def test_encrypted_round_trip():
+    from common.crypto import derive_room_key
+
+    key = derive_room_key("correct horse", "ABC123")
+    t = torch.randn(10, 10)
+    frame = serialize_tensor(t, encrypt_key=key)
+    assert t.numpy().tobytes() not in frame  # ciphertext, not plaintext
+    out, header = deserialize_tensor(frame, decrypt_key=key)
+    assert header["encrypted"] and torch.equal(out, t)
+    with pytest.raises(ValueError):
+        deserialize_tensor(frame)  # no key
+    with pytest.raises(Exception):
+        deserialize_tensor(frame, decrypt_key=derive_room_key("wrong", "ABC123"))
+
+
+def test_50mb_tensor_round_trip():
+    t = torch.randn(50 * 1024 * 1024 // 4)  # 50 MB of float32
+    out, _ = deserialize_tensor(serialize_tensor(t))
+    assert torch.equal(out, t)
+
+
+async def test_local_transport_and_stats():
+    hub = LocalHub()
+    a, b = LocalTransport("a", hub), LocalTransport("b", hub)
+    await a.start()
+    await b.start()
+    await a.send("b", b"hello")
+    assert await b.recv(timeout=1) == ("a", b"hello")
+    stats = a.take_step_stats()
+    assert stats["bytes_sent"] == 5 and stats["frames_sent"] == 1
+    assert a.take_step_stats()["bytes_sent"] == 0  # reset after snapshot
+
+
+async def test_tcp_transport_50mb_bit_exact():
+    a = DirectTCPTransport("a", "127.0.0.1", 0, secret="s3cret")
+    b = DirectTCPTransport("b", "127.0.0.1", 0, secret="s3cret")
+    await a.start()
+    await b.start()
     try:
-        # Register each other's dynamically allocated ports
-        node_a.register_peer("node-b", "127.0.0.1", node_b.listen_port)
-        node_b.register_peer("node-a", "127.0.0.1", node_a.listen_port)
-
-        # Prepare test tensor
-        test_tensor = torch.randn(32, 128, dtype=torch.float32)
-        payload = serialize_tensor(test_tensor, kind="activation", step=1)
-
-        # Send from A to B
-        await node_a.send_tensor(target_node_id="node-b", payload=payload)
-
-        # Receive on B
-        sender_id, received_bytes = await node_b.receive_tensor(timeout=5.0)
-
-        assert sender_id == "node-a"
-        received_tensor, header = deserialize_tensor(received_bytes)
-        assert torch.equal(test_tensor, received_tensor)
-        assert header["step"] == 1
-
-        # Check metrics
-        metrics_a = node_a.get_metrics()
-        metrics_b = node_b.get_metrics()
-        assert metrics_a["total_bytes_sent"] > 0
-        assert metrics_b["total_bytes_received"] > 0
+        a.register_peer("b", "127.0.0.1", b.port)
+        b.register_peer("a", "127.0.0.1", a.port)
+        t = torch.randn(50 * 1024 * 1024 // 4)
+        await a.send("b", serialize_tensor(t, kind="activation"))
+        sender, frame = await b.recv(timeout=30)
+        out, _ = deserialize_tensor(frame)
+        assert sender == "a" and torch.equal(out, t)
+        # and the other direction
+        await b.send("a", serialize_tensor(torch.ones(3), kind="gradient"))
+        sender, frame = await a.recv(timeout=5)
+        assert sender == "b" and torch.equal(deserialize_tensor(frame)[0], torch.ones(3))
     finally:
-        await node_a.stop()
-        await node_b.stop()
+        await a.stop()
+        await b.stop()
 
 
-@pytest.mark.asyncio
-async def test_relay_transport_with_mock_coordinator():
-    """Verify RelayTransport routes messages between nodes through a WebSocket relay."""
-    # Build a minimal relay server simulating coordinator's /ws/relay/{room_code}/{node_id}
-    connected_clients = {}
-
-    async def mock_relay_handler(websocket):
-        raw_path = getattr(getattr(websocket, "request", None), "path", getattr(websocket, "path", ""))
-        path_parts = raw_path.strip("/").split("/")
-        # Path: ws/relay/{room_code}/{node_id}
-        if len(path_parts) >= 4 and path_parts[0] == "ws" and path_parts[1] == "relay":
-            room = path_parts[2]
-            node_id = path_parts[3]
-            connected_clients[(room, node_id)] = websocket
-            try:
-                async for message in websocket:
-                    # Message envelope: [4-byte target_id len][target_id][payload]
-                    (target_len,) = UINT32_STRUCT.unpack_from(message, 0)
-                    target_id = message[UINT32_STRUCT.size : UINT32_STRUCT.size + target_len].decode("utf-8")
-                    raw_payload = message[UINT32_STRUCT.size + target_len :]
-
-                    target_ws = connected_clients.get((room, target_id))
-                    if target_ws:
-                        # Forward envelope: [4-byte sender_id len][sender_id][payload]
-                        sender_bytes = node_id.encode("utf-8")
-                        forward_frame = (
-                            UINT32_STRUCT.pack(len(sender_bytes)) + sender_bytes + raw_payload
-                        )
-                        await target_ws.send(forward_frame)
-            finally:
-                connected_clients.pop((room, node_id), None)
-
-    # Start mock relay server on dynamic port
-    server = await websockets.serve(mock_relay_handler, "127.0.0.1", 0)
-    server_port = server.sockets[0].getsockname()[1]
-    relay_url = f"ws://127.0.0.1:{server_port}"
-
-    room_code = "TEST01"
-    agent_1 = RelayTransport(node_id="agent-1", relay_url=relay_url, room_code=room_code)
-    agent_2 = RelayTransport(node_id="agent-2", relay_url=relay_url, room_code=room_code)
-
-    await agent_1.start()
-    await agent_2.start()
-
-    # Small delay for registration in server
-    await asyncio.sleep(0.05)
-
+async def test_tcp_rejects_wrong_secret():
+    good = DirectTCPTransport("good", "127.0.0.1", 0, secret="right")
+    evil = DirectTCPTransport("evil", "127.0.0.1", 0, secret="wrong")
+    await good.start()
     try:
-        sample_tensor = torch.randn(16, 64, dtype=torch.float32)
-        payload = serialize_tensor(sample_tensor, kind="gradient", step=42)
-
-        # Agent 1 sends to Agent 2 via Relay
-        await agent_1.send_tensor("agent-2", payload)
-
-        sender, recv_payload = await agent_2.receive_tensor(timeout=5.0)
-        assert sender == "agent-1"
-
-        rebuilt, header = deserialize_tensor(recv_payload)
-        assert header["kind"] == "gradient"
-        assert header["step"] == 42
-        assert torch.equal(sample_tensor, rebuilt)
-
-        # Verify metrics tracking
-        m1 = agent_1.get_metrics()
-        m2 = agent_2.get_metrics()
-        assert m1["total_bytes_sent"] > 0
-        assert m2["total_bytes_received"] > 0
+        evil.register_peer("good", "127.0.0.1", good.port)
+        await evil.send("good", b"injected")
+        with pytest.raises(asyncio.TimeoutError):
+            await good.recv(timeout=0.5)
     finally:
-        await agent_1.stop()
-        await agent_2.stop()
-        server.close()
-        await server.wait_closed()
+        await good.stop()
+        await evil.stop()
 
 
-@pytest.mark.asyncio
-async def test_simulated_latency():
-    """Verify that simulate_latency_ms introduces artificial delay."""
-    transport = DirectTCPTransport(node_id="lat-test", simulate_latency_ms=30.0)
-    t0 = asyncio.get_event_loop().time()
-    await transport._apply_simulated_latency()
-    elapsed_ms = (asyncio.get_event_loop().time() - t0) * 1000.0
-    assert elapsed_ms >= 25.0, f"Expected >= 25ms delay, got {elapsed_ms}ms"
+async def test_simulated_latency_delays_delivery_not_sender():
+    hub = LocalHub()
+    a = LocalTransport("a", hub)
+    b = LocalTransport("b", hub, simulate_latency_ms=100)
+    await a.start()
+    await b.start()
+    t0 = time.perf_counter()
+    await a.send("b", b"x")
+    assert time.perf_counter() - t0 < 0.05  # sender not blocked
+    await b.recv(timeout=1)
+    assert time.perf_counter() - t0 >= 0.095  # receiver saw ~100 ms delay

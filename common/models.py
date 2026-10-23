@@ -1,158 +1,78 @@
-"""PoolForge Model Specifications and Dynamic Layer Builder.
+"""Build real PyTorch layers from JSON layer specs.
 
-Enables JSON-serializable model architecture definitions and partial instantiation:
-a node builds ONLY the subset of layers assigned to it, never instantiating the full model.
+The key function is build_layers(specs, start, end): it creates ONLY the
+layers in [start, end). A node in the pool therefore never allocates memory
+for layers that belong to other nodes.
 """
 
-from typing import Any, Dict, List, Tuple
+from typing import Any, Dict, List, Optional
+
 import torch
 import torch.nn as nn
 
 
 def build_single_layer(spec: Dict[str, Any]) -> nn.Module:
-    """Instantiate a single PyTorch layer from its JSON-serializable specification."""
-    ltype = spec.get("type", "").lower()
-
-    if ltype == "linear":
-        in_features = spec["in"]
-        out_features = spec["out"]
-        bias = spec.get("bias", True)
-        layer = nn.Linear(in_features, out_features, bias=bias)
-        # Optional deterministic initialization if provided in spec
-        if "init_weight" in spec:
-            layer.weight.data.copy_(torch.tensor(spec["init_weight"]))
-        if bias and "init_bias" in spec:
-            layer.bias.data.copy_(torch.tensor(spec["init_bias"]))
-        return layer
-
-    elif ltype == "conv2d":
-        in_channels = spec["in_channels"]
-        out_channels = spec["out_channels"]
-        kernel_size = spec["kernel_size"]
-        stride = spec.get("stride", 1)
-        padding = spec.get("padding", 0)
-        bias = spec.get("bias", True)
+    """Create one nn.Module from its spec dict."""
+    t = str(spec.get("type", "")).lower()
+    bias = bool(spec.get("bias", True))
+    if t == "linear":
+        return nn.Linear(spec["in"], spec["out"], bias=bias)
+    if t == "conv2d":
         return nn.Conv2d(
-            in_channels,
-            out_channels,
-            kernel_size=kernel_size,
-            stride=stride,
-            padding=padding,
+            spec["in_channels"],
+            spec["out_channels"],
+            kernel_size=spec["kernel_size"],
+            stride=spec.get("stride", 1),
+            padding=spec.get("padding", 0),
             bias=bias,
         )
-
-    elif ltype == "relu":
+    if t == "maxpool2d":
+        k = spec["kernel_size"]
+        return nn.MaxPool2d(k, stride=spec.get("stride", k), padding=spec.get("padding", 0))
+    if t == "flatten":
+        return nn.Flatten(start_dim=spec.get("start_dim", 1))
+    if t == "relu":
         return nn.ReLU()
-
-    elif ltype == "gelu":
+    if t == "gelu":
         return nn.GELU()
-
-    elif ltype == "sigmoid":
+    if t == "sigmoid":
         return nn.Sigmoid()
-
-    elif ltype == "tanh":
+    if t == "tanh":
         return nn.Tanh()
-
-    elif ltype == "flatten":
-        start_dim = spec.get("start_dim", 1)
-        return nn.Flatten(start_dim=start_dim)
-
-    elif ltype == "maxpool2d":
-        kernel_size = spec["kernel_size"]
-        stride = spec.get("stride", kernel_size)
-        padding = spec.get("padding", 0)
-        return nn.MaxPool2d(kernel_size=kernel_size, stride=stride, padding=padding)
-
-    elif ltype == "dropout":
-        p = spec.get("p", 0.5)
-        return nn.Dropout(p=p)
-
-    elif ltype == "batchnorm1d":
-        num_features = spec["num_features"]
-        return nn.BatchNorm1d(num_features=num_features)
-
-    elif ltype == "batchnorm2d":
-        num_features = spec["num_features"]
-        return nn.BatchNorm2d(num_features=num_features)
-
-    else:
-        raise ValueError(f"Unsupported layer type: {ltype}")
+    if t == "dropout":
+        return nn.Dropout(p=spec.get("p", 0.5))
+    if t == "batchnorm1d":
+        return nn.BatchNorm1d(spec["num_features"])
+    if t == "batchnorm2d":
+        return nn.BatchNorm2d(spec["num_features"])
+    raise ValueError(f"Unsupported layer type: {t!r}")
 
 
-def build_layers(specs: List[Dict[str, Any]], start: int, end: int) -> nn.Sequential:
-    """Build only the contiguous slice [start, end) of layers specified.
+def build_layers(
+    specs: List[Dict[str, Any]], start: int, end: int, seed: Optional[int] = 0
+) -> nn.Sequential:
+    """Build only layers [start, end).
 
-    Args:
-        specs: Complete list of layer specifications for the model.
-        start: Inclusive start layer index.
-        end: Exclusive end layer index.
-
-    Returns:
-        nn.Sequential module containing only the requested sub-range of layers.
+    If `seed` is given, layer i is initialised with torch seed (seed + i). So
+    layer 5 gets exactly the same starting weights whether it is built alone on
+    laptop B or as part of the full model on one machine. That is what makes
+    the split-vs-single loss test possible.
     """
-    if start < 0 or end > len(specs) or start >= end:
-        raise ValueError(f"Invalid layer range [{start}, {end}) for {len(specs)} specs")
-
-    sub_specs = specs[start:end]
-    modules = [build_single_layer(s) for s in sub_specs]
+    if not (0 <= start < end <= len(specs)):
+        raise ValueError(f"Invalid layer range [{start}, {end}) for {len(specs)} layers")
+    modules = []
+    for i in range(start, end):
+        if seed is not None:
+            torch.manual_seed(seed + i)
+        modules.append(build_single_layer(specs[i]))
     return nn.Sequential(*modules)
 
 
-def count_layer_parameters(spec: Dict[str, Any]) -> int:
-    """Calculate the number of learnable parameters for a layer spec without instantiating it."""
-    ltype = spec.get("type", "").lower()
-    bias = spec.get("bias", True)
-
-    if ltype == "linear":
-        in_f = spec["in"]
-        out_f = spec["out"]
-        return (in_f * out_f) + (out_f if bias else 0)
-
-    elif ltype == "conv2d":
-        in_c = spec["in_channels"]
-        out_c = spec["out_channels"]
-        k = spec["kernel_size"]
-        if isinstance(k, (list, tuple)):
-            k_w, k_h = k[0], k[1]
-        else:
-            k_w, k_h = k, k
-        params = in_c * out_c * k_w * k_h
-        if bias:
-            params += out_c
-        return params
-
-    elif ltype in ("batchnorm1d", "batchnorm2d"):
-        num_f = spec["num_features"]
-        # Weight (gamma) and bias (beta)
-        return 2 * num_f
-
-    return 0
-
-
-def estimate_layer_memory_bytes(
-    spec: Dict[str, Any],
-    batch_size: int,
-    approx_activation_elements: int = 1024,
-) -> int:
-    """Estimate memory requirement for a single layer in bytes.
-
-    Formula from specification:
-        Memory per layer = params * 4 bytes * 4 (weights + grads + Adam states)
-                           + activation size * batch * 4 bytes
-    """
-    params = count_layer_parameters(spec)
-    # 4 bytes per float32 * 4 (weights + grads + Adam 1st moment + Adam 2nd moment)
-    param_memory = params * 4 * 4
-
-    # Activation memory in bytes
-    activation_memory = approx_activation_elements * batch_size * 4
-
-    return param_memory + activation_memory
-
-
-def estimate_pipeline_memory(
-    specs: List[Dict[str, Any]],
-    batch_size: int = 32,
-) -> List[int]:
-    """Return a list of estimated memory footprints (in bytes) for each layer."""
-    return [estimate_layer_memory_bytes(s, batch_size=batch_size) for s in specs]
+def make_optimizer(params, name: str, lr: float) -> Optional[torch.optim.Optimizer]:
+    """Each stage owns an optimizer for its own parameters only."""
+    params = list(params)
+    if not params:  # e.g. a stage made only of ReLU/Flatten layers
+        return None
+    if name.lower() == "adam":
+        return torch.optim.Adam(params, lr=lr)
+    return torch.optim.SGD(params, lr=lr, momentum=0.9)

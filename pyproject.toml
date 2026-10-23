@@ -1,0 +1,40 @@
+# PoolForge packaging.
+#
+# `pip install -e .` installs the `poolforge` command (the agent CLI) plus the
+# shared `common` package it needs. The coordinator lives in the same repo and
+# is started with `python -m coordinator.server` (or Docker).
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "poolforge"
+version = "1.0.0"
+description = "Pool laptops' spare RAM/compute to train AI models and host apps together."
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "torch>=2.2",
+    "numpy>=1.24",
+    "psutil>=5.9",
+    "websockets>=12.0",
+    "pydantic>=2.5",
+]
+
+[project.optional-dependencies]
+# Real MNIST download; without it the agent falls back to synthetic data.
+vision = ["torchvision>=0.17"]
+# Optional AES-GCM payload encryption (--encrypt-passphrase).
+crypto = ["cryptography>=41"]
+
+[project.scripts]
+poolforge = "agent.cli:main"
+
+[tool.setuptools]
+packages = ["agent", "common", "coordinator"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+asyncio_mode = "auto"
+asyncio_default_fixture_loop_scope = "function"

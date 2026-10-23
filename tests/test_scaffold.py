@@ -1,59 +1,32 @@
-"""Scaffold tests for PoolForge environment and baseline requirements."""
+"""Phase 0: the environment is usable and the packages import."""
 
-import os
 import sys
-import pytest
 
 
 def test_python_version():
-    """Verify supported Python runtime (>= 3.10)."""
-    assert sys.version_info >= (3, 10), "PoolForge requires Python 3.10 or newer."
+    assert sys.version_info >= (3, 10)
 
 
-def test_core_dependencies_importable():
-    """Verify all pinned dependencies import cleanly."""
-    import torch
-    import numpy as np
-    import fastapi
-    import uvicorn
-    import pydantic
-    import websockets
-    import psutil
-    import cryptography
-
-    assert torch.__version__ is not None
-    assert np.__version__ is not None
-    assert fastapi.__version__ is not None
-    assert uvicorn.__version__ is not None
-    assert pydantic.__version__ is not None
-    assert websockets.__version__ is not None
-    assert psutil.__version__ is not None
-    assert cryptography.__version__ is not None
-
-
-def test_common_package():
-    """Verify common package is accessible."""
-    import common
-    assert common.__version__ == "0.1.0"
-
-
-def test_agent_package():
-    """Verify agent package is accessible."""
+def test_packages_import():
     import agent
-    assert agent.__version__ == "0.1.0"
-
-
-def test_coordinator_package():
-    """Verify coordinator package is accessible."""
+    import common
     import coordinator
-    assert coordinator.__version__ == "0.1.0"
+
+    assert common.__version__ == agent.__version__ == coordinator.__version__
 
 
-def test_cross_platform_pathing(tmp_path):
-    """Verify file paths work across Windows and Linux without unix-only assumptions."""
-    sample_dir = tmp_path / "poolforge_test"
-    sample_dir.mkdir()
-    sample_file = sample_dir / "test.txt"
-    sample_file.write_text("poolforge cross platform", encoding="utf-8")
-    assert sample_file.read_text(encoding="utf-8") == "poolforge cross platform"
-    assert os.path.exists(os.path.normpath(str(sample_file)))
+def test_coordinator_side_code_does_not_need_torch():
+    """The coordinator plans splits with pure-Python spec code, so its Docker image can skip torch."""
+    import ast
+    from pathlib import Path
+
+    root = Path(__file__).resolve().parent.parent
+    files = list((root / "coordinator").glob("*.py")) + [root / "common" / f for f in ("specs.py", "model_zoo.py", "schemas.py", "apps.py")]
+    for f in files:
+        if not f.exists():
+            continue
+        for node in ast.walk(ast.parse(f.read_text(encoding="utf-8"))):
+            if isinstance(node, (ast.Import, ast.ImportFrom)):
+                names = [a.name for a in node.names] if isinstance(node, ast.Import) else [node.module or ""]
+                assert not any(n.split(".")[0] == "torch" for n in names), f"{f.name} imports torch"
+                assert not any(n in ("common.models", "common.pipeline", "common.protocol") for n in names), f.name

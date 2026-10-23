@@ -1,16 +1,20 @@
-# PoolForge pinned requirements
-# Target: Windows and Linux (Python >= 3.10)
+# PoolForge pinned requirements (everything: coordinator + agent + tests + benchmarks).
+# Python >= 3.10, Windows and Linux.
+#
+# Smaller sets:
+#   requirements-coordinator.txt  -> coordinator only (no torch), used by Docker
+#   pip install -e .              -> agent CLI (`poolforge`) + shared code
 
-torch==2.12.0
+torch==2.12.1
+torchvision==0.27.1
 numpy==2.5.4
 fastapi==0.136.3
 uvicorn[standard]==0.48.0
 pydantic==2.13.4
 websockets==16.0
 psutil==7.2.2
+cryptography==50.0.2
 matplotlib==3.11.2
+httpx==0.28.1
 pytest==9.1.1
 pytest-asyncio==1.4.0
-httpx==0.28.1
-requests==2.34.2
-cryptography==50.0.2

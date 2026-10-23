@@ -1,119 +1,110 @@
-"""PoolForge Pipeline Parallelism Scheduler.
+"""Split planner: which node runs which layers.
 
-Assigns CONTIGUOUS layer ranges proportional to each worker node's reported free RAM cap.
-Validates memory boundaries and fails early with "pool too small" if the model cannot fit.
+Rules (from the project spec):
+  * every node gets ONE contiguous range of layers (pipeline order),
+  * ranges are sized in proportion to each node's free RAM,
+  * every range must fit its node, otherwise we fail with "pool too small".
+
+Algorithm (simple and explainable):
+  1. Estimate memory per layer with common.specs.estimate_memory.
+  2. Order nodes by free RAM, biggest first (fewer layers on weak laptops).
+  3. Walk the layers; node i keeps taking layers while it stays under its
+     proportional share of the model (and under its RAM budget), always
+     leaving at least one layer for each remaining node.
+  4. Check every stage fits; if not, explain exactly which node is too small.
+
+Nodes that would only get zero-parameter layers are not wasted on tiny
+models: we never use more stages than the model has layers.
 """
 
-from typing import Any, Dict, List
-from common.models import estimate_pipeline_memory
-from common.schemas import NodeTelemetry, SplitPlanStage
+from dataclasses import asdict, dataclass
+from typing import Any, Dict, List, Sequence
+
+from common.specs import estimate_memory
+
+GB = 1024 ** 3
+MB = 1024 ** 2
+# Keep 10% of each node's free RAM spare for PyTorch itself and the OS.
+USABLE_FRACTION = 0.9
 
 
-def schedule_pipeline_split(
-    layer_specs: List[Dict[str, Any]],
-    nodes: List[NodeTelemetry],
-    batch_size: int = 16,
-) -> List[SplitPlanStage]:
-    """Partition model layer specifications across available nodes.
+@dataclass
+class NodeCapacity:
+    node_id: str
+    ram_free_gb: float
 
-    Args:
-        layer_specs: Complete ordered list of model layers.
-        nodes: Available healthy worker nodes in the pool.
-        batch_size: Training batch size used for activation sizing.
 
-    Returns:
-        List of SplitPlanStage allocations with contiguous layer ranges [start, end).
+@dataclass
+class StagePlan:
+    node_id: str
+    stage_index: int
+    start_layer: int
+    end_layer: int
+    estimated_mb: float
+    budget_mb: float
 
-    Raises:
-        ValueError: If pool has 0 nodes, or if total pool RAM is insufficient ("pool too small").
-    """
+    def to_dict(self) -> Dict[str, Any]:
+        return asdict(self)
+
+
+class PoolTooSmall(ValueError):
+    """Raised when the model cannot fit into the pool's free RAM."""
+
+
+def plan_split(
+    specs: List[Dict[str, Any]],
+    input_shape: Sequence[int],
+    nodes: List[NodeCapacity],
+    batch_size: int,
+) -> List[StagePlan]:
     if not nodes:
-        raise ValueError("Cannot schedule: pool has 0 available worker nodes")
+        raise PoolTooSmall("pool too small: no nodes are connected")
+    layer_mem = estimate_memory(specs, tuple(input_shape), batch_size)
+    total = sum(layer_mem)
 
-    num_layers = len(layer_specs)
-    if num_layers == 0:
-        raise ValueError("Cannot schedule: model has 0 layers")
-
-    # Limit active stages to min(len(nodes), num_layers)
-    active_nodes = nodes[:num_layers]
-    num_stages = len(active_nodes)
-
-    # 1. Estimate memory footprint per layer in bytes
-    layer_mem_bytes = estimate_pipeline_memory(layer_specs, batch_size=batch_size)
-    total_model_mem_bytes = sum(layer_mem_bytes)
-    total_model_mem_gb = total_model_mem_bytes / (1024 ** 3)
-
-    # 2. Check total pool capacity
-    node_capacities_bytes = [int(n.ram_free_gb * (1024 ** 3)) for n in active_nodes]
-    total_pool_bytes = sum(node_capacities_bytes)
-
-    if total_pool_bytes < total_model_mem_bytes:
-        raise ValueError(
-            f"pool too small: model requires {total_model_mem_gb:.3f} GB, "
-            f"but pool only has {total_pool_bytes / (1024 ** 3):.3f} GB free"
+    # Biggest node first; never more stages than layers.
+    nodes = sorted(nodes, key=lambda n: n.ram_free_gb, reverse=True)[: len(specs)]
+    budgets = [n.ram_free_gb * GB * USABLE_FRACTION for n in nodes]
+    if total > sum(budgets):
+        raise PoolTooSmall(
+            f"pool too small: model needs ~{total / MB:.0f} MB but the pool has only "
+            f"{sum(budgets) / MB:.0f} MB usable ({len(nodes)} node(s)). Add a laptop or shrink the model."
         )
 
-    # 3. Allocate contiguous slices proportional to node RAM capacities
-    # Use greedy prefix-sum partitioning to match target fractions
-    allocations: List[SplitPlanStage] = []
-    current_start = 0
+    try:
+        return _greedy(specs, nodes, layer_mem, budgets, proportional=True)
+    except PoolTooSmall:
+        # Proportional shares didn't work out (e.g. one huge layer at the end).
+        # Second try: let each node take as many layers as its RAM allows.
+        return _greedy(specs, nodes, layer_mem, budgets, proportional=False)
 
-    for stage_idx in range(num_stages):
-        is_last_stage = (stage_idx == num_stages - 1)
-        node = active_nodes[stage_idx]
-        node_cap_bytes = node_capacities_bytes[stage_idx]
 
-        if is_last_stage:
-            # Last node takes all remaining layers
-            assigned_end = num_layers
+def _greedy(specs, nodes, layer_mem, budgets, proportional: bool) -> List[StagePlan]:
+    total = sum(layer_mem)
+    plans: List[StagePlan] = []
+    start = 0
+    for i, node in enumerate(nodes):
+        remaining_nodes = len(nodes) - i - 1
+        if remaining_nodes == 0:
+            end = len(specs)  # last node takes everything left
         else:
-            # Target memory for this node based on its fraction of total remaining capacity
-            remaining_pool_bytes = sum(node_capacities_bytes[stage_idx:])
-            fraction = node_cap_bytes / max(remaining_pool_bytes, 1)
-
-            remaining_layers = num_layers - current_start
-            remaining_stages = num_stages - stage_idx
-
-            # Each stage must receive at least 1 layer
-            min_layers_needed_for_future = remaining_stages - 1
-
-            # Accumulate layers until fraction of remaining memory is met
-            accumulated_mem = 0
-            candidate_end = current_start + 1
-
-            target_mem_this_stage = fraction * sum(layer_mem_bytes[current_start:])
-
-            for idx in range(current_start, num_layers - min_layers_needed_for_future):
-                accumulated_mem += layer_mem_bytes[idx]
-                if accumulated_mem >= target_mem_this_stage:
-                    candidate_end = idx + 1
+            share = total * budgets[i] / sum(budgets) if proportional else float("inf")
+            end, used = start, 0
+            max_end = len(specs) - remaining_nodes  # leave >= 1 layer per later node
+            while end < max_end:
+                nxt = used + layer_mem[end]
+                # Stop if the next layer would overflow the budget, or if we are
+                # already at our proportional share (but always take >= 1 layer).
+                if end > start and (nxt > budgets[i] or used >= share):
                     break
-                candidate_end = idx + 1
-
-            # Ensure we do not starve future stages
-            max_allowed_end = num_layers - min_layers_needed_for_future
-            assigned_end = min(candidate_end, max_allowed_end)
-            assigned_end = max(assigned_end, current_start + 1)
-
-        # Validate memory fit for this stage
-        stage_mem = sum(layer_mem_bytes[current_start:assigned_end])
-        if stage_mem > node_cap_bytes:
-            raise ValueError(
-                f"pool too small: node '{node.node_id}' capped at {node.ram_free_gb:.3f} GB, "
-                f"cannot fit assigned partition [{current_start}, {assigned_end}) requiring {stage_mem / (1024 ** 3):.3f} GB"
+                used = nxt
+                end += 1
+        stage_mem = sum(layer_mem[start:end])
+        if stage_mem > budgets[i]:
+            raise PoolTooSmall(
+                f"pool too small: node '{node.node_id}' has {budgets[i] / MB:.0f} MB usable but its "
+                f"layers [{start}, {end}) need ~{stage_mem / MB:.0f} MB"
             )
-
-        allocations.append(
-            SplitPlanStage(
-                node_id=node.node_id,
-                stage_index=stage_idx,
-                start_layer=current_start,
-                end_layer=assigned_end,
-                num_layers=assigned_end - current_start,
-                estimated_ram_mb=round(stage_mem / (1024 * 1024), 2),
-                node_ram_cap_gb=node.ram_free_gb,
-            )
-        )
-        current_start = assigned_end
-
-    return allocations
+        plans.append(StagePlan(node.node_id, i, start, end, round(stage_mem / MB, 2), round(budgets[i] / MB, 2)))
+        start = end
+    return plans
