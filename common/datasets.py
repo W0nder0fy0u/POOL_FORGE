@@ -10,6 +10,8 @@ activations so the last stage can compute the loss.
                 to synthetic data of the same shape and log a warning.
 """
 
+import contextlib
+import io
 import logging
 from typing import Iterator, Sequence, Tuple
 
@@ -37,10 +39,10 @@ def synthetic_batches(
 
 def mnist_batches(batch_size: int, seed: int = 0, data_dir: str = "./data") -> Iterator[Batch]:
     """Endless shuffled MNIST batches (re-shuffled every epoch)."""
-    from torchvision import datasets, transforms  # optional dependency
+    from torchvision import datasets  # optional dependency
 
-    tf = transforms.Compose([transforms.ToTensor(), transforms.Normalize((0.1307,), (0.3081,))])
-    ds = datasets.MNIST(data_dir, train=True, download=True, transform=tf)
+    with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):  # hide progress bars
+        ds = datasets.MNIST(data_dir, train=True, download=True)
     # Convert once to big tensors: much faster than a DataLoader for tiny images.
     xs = ds.data.unsqueeze(1).float().div(255.0).sub(0.1307).div(0.3081)
     ys = ds.targets.clone()
@@ -53,14 +55,15 @@ def mnist_batches(batch_size: int, seed: int = 0, data_dir: str = "./data") -> I
 
 
 def get_batches(
-    dataset: str, input_shape: Sequence[int], num_classes: int, batch_size: int, seed: int = 0
+    dataset: str, input_shape: Sequence[int], num_classes: int, batch_size: int, seed: int = 0,
+    data_dir: str = "./data",
 ) -> Tuple[Iterator[Batch], str]:
     """Return (batch iterator, name of the dataset actually used)."""
     if dataset == "mnist":
         if list(input_shape) != [1, 28, 28]:
             raise ValueError("MNIST models need input shape (1, 28, 28)")
         try:
-            it = mnist_batches(batch_size, seed)
+            it = mnist_batches(batch_size, seed, data_dir)
             first = next(it)  # triggers the download now, so errors happen here
 
             def chain():

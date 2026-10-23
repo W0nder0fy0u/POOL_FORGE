@@ -1,216 +1,204 @@
-"""PoolForge Coordinator SQLite Database.
+"""SQLite persistence for the coordinator (rooms, nodes, jobs, metrics, apps).
 
-Stores persistent room state, connected nodes, training jobs, and historical metrics.
-Uses standard Python sqlite3 with WAL mode for fast concurrent reads and writes.
+Live things (open WebSockets, latest RAM/CPU numbers) are kept in memory in
+coordinator/state.py; this database keeps what should survive a restart and
+what the Reports page exports.
+
+Secrets (admin tokens, node tokens) are stored only as SHA-256 hashes, so a
+leaked database file does not leak working tokens.
 """
 
+import hashlib
 import json
 import sqlite3
+import threading
 import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional
-from common.schemas import NodeTelemetry
+
+SCHEMA = """
+CREATE TABLE IF NOT EXISTS rooms (
+    code TEXT PRIMARY KEY,
+    admin_hash TEXT NOT NULL,
+    locked INTEGER NOT NULL DEFAULT 0,
+    created_at REAL NOT NULL
+);
+CREATE TABLE IF NOT EXISTS nodes (
+    node_id TEXT NOT NULL,
+    room TEXT NOT NULL,
+    token_hash TEXT NOT NULL,
+    hostname TEXT NOT NULL,
+    os TEXT NOT NULL,
+    joined_at REAL NOT NULL,
+    PRIMARY KEY (room, node_id)
+);
+CREATE TABLE IF NOT EXISTS jobs (
+    job_id TEXT PRIMARY KEY,
+    room TEXT NOT NULL,
+    model TEXT NOT NULL,
+    config TEXT NOT NULL,
+    plan TEXT NOT NULL,
+    transport TEXT NOT NULL,
+    status TEXT NOT NULL,
+    detail TEXT NOT NULL DEFAULT '',
+    created_at REAL NOT NULL,
+    finished_at REAL
+);
+CREATE TABLE IF NOT EXISTS metrics (
+    job_id TEXT NOT NULL,
+    step INTEGER NOT NULL,
+    epoch INTEGER NOT NULL,
+    loss REAL,
+    step_time_ms REAL NOT NULL,
+    samples_per_s REAL NOT NULL,
+    t REAL NOT NULL
+);
+CREATE TABLE IF NOT EXISTS node_metrics (
+    job_id TEXT NOT NULL,
+    node_id TEXT NOT NULL,
+    stage INTEGER NOT NULL,
+    step INTEGER NOT NULL,
+    step_time_ms REAL NOT NULL,
+    bytes_sent INTEGER NOT NULL,
+    bytes_received INTEGER NOT NULL,
+    avg_send_ms REAL NOT NULL,
+    proc_ram_mb REAL NOT NULL,
+    t REAL NOT NULL
+);
+CREATE TABLE IF NOT EXISTS deployments (
+    id TEXT PRIMARY KEY,
+    room TEXT NOT NULL,
+    node_id TEXT NOT NULL,
+    app_id TEXT NOT NULL,
+    status TEXT NOT NULL,
+    url TEXT,
+    detail TEXT NOT NULL DEFAULT '',
+    created_at REAL NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_metrics_job ON metrics(job_id, step);
+CREATE INDEX IF NOT EXISTS idx_node_metrics_job ON node_metrics(job_id, step);
+"""
 
 
-class CoordinatorDB:
-    """Thread-safe SQLite database manager for coordinator state."""
+def hash_token(token: str) -> str:
+    return hashlib.sha256(token.encode("utf-8")).hexdigest()
 
-    def __init__(self, db_path: str = "poolforge.db"):
-        self.db_path = db_path
-        self._init_db()
 
-    def _get_connection(self) -> sqlite3.Connection:
-        conn = sqlite3.connect(self.db_path, timeout=10.0)
-        conn.row_factory = sqlite3.Row
-        # Enable WAL mode for high concurrency
-        conn.execute("PRAGMA journal_mode=WAL;")
-        return conn
+class DB:
+    """Tiny wrapper around one sqlite3 connection (guarded by a lock)."""
 
-    def _init_db(self) -> None:
-        """Create database tables if they do not exist."""
-        with self._get_connection() as conn:
-            conn.executescript(
-                """
-                CREATE TABLE IF NOT EXISTS rooms (
-                    room_code TEXT PRIMARY KEY,
-                    admin_token TEXT NOT NULL,
-                    created_at REAL NOT NULL,
-                    status TEXT NOT NULL DEFAULT 'idle'
-                );
+    def __init__(self, path: str):
+        if path != ":memory:":
+            Path(path).parent.mkdir(parents=True, exist_ok=True)
+        self.conn = sqlite3.connect(path, check_same_thread=False)
+        self.conn.row_factory = sqlite3.Row
+        if path != ":memory:":
+            self.conn.execute("PRAGMA journal_mode=WAL")
+        self.conn.executescript(SCHEMA)
+        self.lock = threading.Lock()
+        # Jobs that were running when the coordinator stopped can't continue.
+        self.execute(
+            "UPDATE jobs SET status='interrupted', finished_at=? WHERE status IN ('running','paused','waiting')",
+            (time.time(),),
+        )
 
-                CREATE TABLE IF NOT EXISTS nodes (
-                    node_id TEXT PRIMARY KEY,
-                    room_code TEXT NOT NULL,
-                    hostname TEXT NOT NULL,
-                    os_name TEXT NOT NULL,
-                    ram_total_gb REAL NOT NULL,
-                    ram_free_gb REAL NOT NULL,
-                    cpu_percent REAL NOT NULL,
-                    status TEXT NOT NULL DEFAULT 'idle',
-                    transport_type TEXT NOT NULL DEFAULT 'relay',
-                    tcp_host TEXT,
-                    tcp_port INTEGER,
-                    assigned_layers TEXT,
-                    last_heartbeat REAL NOT NULL,
-                    FOREIGN KEY (room_code) REFERENCES rooms(room_code)
-                );
+    def execute(self, sql: str, args: tuple = ()) -> None:
+        with self.lock, self.conn:
+            self.conn.execute(sql, args)
 
-                CREATE TABLE IF NOT EXISTS jobs (
-                    job_id TEXT PRIMARY KEY,
-                    room_code TEXT NOT NULL,
-                    model_name TEXT NOT NULL,
-                    status TEXT NOT NULL DEFAULT 'running',
-                    created_at REAL NOT NULL,
-                    finished_at REAL,
-                    config_json TEXT NOT NULL,
-                    FOREIGN KEY (room_code) REFERENCES rooms(room_code)
-                );
+    def query(self, sql: str, args: tuple = ()) -> List[Dict[str, Any]]:
+        with self.lock:
+            return [dict(r) for r in self.conn.execute(sql, args).fetchall()]
 
-                CREATE TABLE IF NOT EXISTS metrics (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    job_id TEXT NOT NULL,
-                    step INTEGER NOT NULL,
-                    epoch INTEGER NOT NULL,
-                    loss REAL NOT NULL,
-                    step_time_ms REAL NOT NULL,
-                    throughput REAL NOT NULL,
-                    created_at REAL NOT NULL,
-                    FOREIGN KEY (job_id) REFERENCES jobs(job_id)
-                );
-                """
-            )
+    def one(self, sql: str, args: tuple = ()) -> Optional[Dict[str, Any]]:
+        rows = self.query(sql, args)
+        return rows[0] if rows else None
 
-    def create_room(self, room_code: str, admin_token: str) -> None:
-        """Insert a newly created room."""
-        with self._get_connection() as conn:
-            conn.execute(
-                "INSERT INTO rooms (room_code, admin_token, created_at, status) VALUES (?, ?, ?, 'idle')",
-                (room_code, admin_token, time.time()),
-            )
+    # ---------------------------------------------------------------- rooms
+    def create_room(self, code: str, admin_token: str) -> None:
+        self.execute("INSERT INTO rooms VALUES (?, ?, 0, ?)", (code, hash_token(admin_token), time.time()))
 
-    def get_room(self, room_code: str) -> Optional[Dict[str, Any]]:
-        """Fetch room record by code."""
-        with self._get_connection() as conn:
-            row = conn.execute("SELECT * FROM rooms WHERE room_code = ?", (room_code,)).fetchone()
-            return dict(row) if row else None
+    def get_room(self, code: str) -> Optional[Dict[str, Any]]:
+        return self.one("SELECT * FROM rooms WHERE code=?", (code,))
 
-    def upsert_node(self, room_code: str, telemetry: NodeTelemetry) -> None:
-        """Register or update telemetry for a worker node."""
-        with self._get_connection() as conn:
-            assigned_json = json.dumps(telemetry.assigned_layers) if telemetry.assigned_layers else None
-            conn.execute(
-                """
-                INSERT INTO nodes (
-                    node_id, room_code, hostname, os_name, ram_total_gb, ram_free_gb,
-                    cpu_percent, status, transport_type, tcp_host, tcp_port, assigned_layers, last_heartbeat
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                ON CONFLICT(node_id) DO UPDATE SET
-                    room_code = excluded.room_code,
-                    hostname = excluded.hostname,
-                    os_name = excluded.os_name,
-                    ram_total_gb = excluded.ram_total_gb,
-                    ram_free_gb = excluded.ram_free_gb,
-                    cpu_percent = excluded.cpu_percent,
-                    status = excluded.status,
-                    transport_type = excluded.transport_type,
-                    tcp_host = excluded.tcp_host,
-                    tcp_port = excluded.tcp_port,
-                    assigned_layers = excluded.assigned_layers,
-                    last_heartbeat = excluded.last_heartbeat
-                """,
-                (
-                    telemetry.node_id,
-                    room_code,
-                    telemetry.hostname,
-                    telemetry.os_name,
-                    telemetry.ram_total_gb,
-                    telemetry.ram_free_gb,
-                    telemetry.cpu_percent,
-                    telemetry.status,
-                    telemetry.transport_type,
-                    telemetry.tcp_host,
-                    telemetry.tcp_port,
-                    assigned_json,
-                    time.time(),
-                ),
-            )
+    def set_locked(self, code: str, locked: bool) -> None:
+        self.execute("UPDATE rooms SET locked=? WHERE code=?", (int(locked), code))
 
-    def get_room_nodes(self, room_code: str, max_age_seconds: float = 10.0) -> List[NodeTelemetry]:
-        """Retrieve all active nodes in a room with recent heartbeats."""
-        with self._get_connection() as conn:
-            cutoff = time.time() - max_age_seconds
-            rows = conn.execute(
-                "SELECT * FROM nodes WHERE room_code = ? AND last_heartbeat >= ? ORDER BY node_id ASC",
-                (room_code, cutoff),
-            ).fetchall()
+    # ---------------------------------------------------------------- nodes
+    def add_node(self, room: str, node_id: str, token: str, hostname: str, os_name: str) -> None:
+        self.execute(
+            "INSERT OR REPLACE INTO nodes VALUES (?, ?, ?, ?, ?, ?)",
+            (node_id, room, hash_token(token), hostname, os_name, time.time()),
+        )
 
-            result = []
-            for r in rows:
-                assigned = json.loads(r["assigned_layers"]) if r["assigned_layers"] else None
-                result.append(
-                    NodeTelemetry(
-                        node_id=r["node_id"],
-                        hostname=r["hostname"],
-                        os_name=r["os_name"],
-                        ram_total_gb=r["ram_total_gb"],
-                        ram_free_gb=r["ram_free_gb"],
-                        cpu_percent=r["cpu_percent"],
-                        status=r["status"],
-                        transport_type=r["transport_type"],
-                        tcp_host=r["tcp_host"],
-                        tcp_port=r["tcp_port"],
-                        assigned_layers=assigned,
-                    )
-                )
-            return result
+    def get_node(self, room: str, node_id: str) -> Optional[Dict[str, Any]]:
+        return self.one("SELECT * FROM nodes WHERE room=? AND node_id=?", (room, node_id))
 
-    def remove_node(self, node_id: str) -> None:
-        """Remove a disconnected node."""
-        with self._get_connection() as conn:
-            conn.execute("DELETE FROM nodes WHERE node_id = ?", (node_id,))
+    def list_nodes(self, room: str) -> List[Dict[str, Any]]:
+        return self.query("SELECT node_id, hostname, os, joined_at FROM nodes WHERE room=?", (room,))
 
-    def create_job(self, job_id: str, room_code: str, model_name: str, config: Dict[str, Any]) -> None:
-        """Create a new training job entry."""
-        with self._get_connection() as conn:
-            conn.execute(
-                "INSERT INTO jobs (job_id, room_code, model_name, status, created_at, config_json) VALUES (?, ?, ?, 'running', ?, ?)",
-                (job_id, room_code, model_name, time.time(), json.dumps(config)),
-            )
-            conn.execute("UPDATE rooms SET status = 'running' WHERE room_code = ?", (room_code,))
+    # ----------------------------------------------------------------- jobs
+    def create_job(self, job_id: str, room: str, model: str, config: dict, plan: list, transport: str) -> None:
+        self.execute(
+            "INSERT INTO jobs (job_id, room, model, config, plan, transport, status, created_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, 'running', ?)",
+            (job_id, room, model, json.dumps(config), json.dumps(plan), transport, time.time()),
+        )
 
-    def update_job_status(self, job_id: str, status: str) -> None:
-        """Update job status (e.g. paused, completed, stopped)."""
-        with self._get_connection() as conn:
-            finished = time.time() if status in ("completed", "stopped", "error") else None
-            conn.execute(
-                "UPDATE jobs SET status = ?, finished_at = ? WHERE job_id = ?",
-                (status, finished, job_id),
-            )
+    def set_job_status(self, job_id: str, status: str, detail: str = "") -> None:
+        finished = time.time() if status in ("completed", "stopped", "failed") else None
+        self.execute(
+            "UPDATE jobs SET status=?, detail=?, finished_at=COALESCE(?, finished_at) WHERE job_id=?",
+            (status, detail, finished, job_id),
+        )
 
-    def record_metric(
-        self,
-        job_id: str,
-        step: int,
-        epoch: int,
-        loss: float,
-        step_time_ms: float,
-        throughput: float,
-    ) -> None:
-        """Record step training metric."""
-        with self._get_connection() as conn:
-            conn.execute(
-                """
-                INSERT INTO metrics (job_id, step, epoch, loss, step_time_ms, throughput, created_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?)
-                """,
-                (job_id, step, epoch, loss, step_time_ms, throughput, time.time()),
-            )
+    def get_job(self, job_id: str) -> Optional[Dict[str, Any]]:
+        row = self.one("SELECT * FROM jobs WHERE job_id=?", (job_id,))
+        if row:
+            row["config"] = json.loads(row["config"])
+            row["plan"] = json.loads(row["plan"])
+        return row
 
-    def get_job_metrics(self, job_id: str) -> List[Dict[str, Any]]:
-        """Fetch all historical step metrics for a job."""
-        with self._get_connection() as conn:
-            rows = conn.execute(
-                "SELECT step, epoch, loss, step_time_ms, throughput, created_at FROM metrics WHERE job_id = ? ORDER BY step ASC",
-                (job_id,),
-            ).fetchall()
-            return [dict(r) for r in rows]
+    def list_jobs(self, room: str) -> List[Dict[str, Any]]:
+        return self.query(
+            "SELECT job_id, model, transport, status, detail, created_at, finished_at FROM jobs "
+            "WHERE room=? ORDER BY created_at DESC",
+            (room,),
+        )
+
+    # -------------------------------------------------------------- metrics
+    def add_metric(self, job_id: str, step: int, epoch: int, loss: Optional[float], step_ms: float, sps: float) -> None:
+        self.execute("INSERT INTO metrics VALUES (?, ?, ?, ?, ?, ?, ?)", (job_id, step, epoch, loss, step_ms, sps, time.time()))
+
+    def add_node_metric(self, job_id: str, node_id: str, m: Any) -> None:
+        self.execute(
+            "INSERT INTO node_metrics VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (job_id, node_id, m.stage, m.step, m.step_time_ms, m.bytes_sent, m.bytes_received,
+             m.avg_send_ms, m.proc_ram_mb, time.time()),
+        )
+
+    def job_metrics(self, job_id: str) -> List[Dict[str, Any]]:
+        return self.query("SELECT step, epoch, loss, step_time_ms, samples_per_s, t FROM metrics WHERE job_id=? ORDER BY step", (job_id,))
+
+    def job_node_metrics(self, job_id: str) -> List[Dict[str, Any]]:
+        return self.query(
+            "SELECT node_id, stage, step, step_time_ms, bytes_sent, bytes_received, avg_send_ms, proc_ram_mb, t "
+            "FROM node_metrics WHERE job_id=? ORDER BY step, stage",
+            (job_id,),
+        )
+
+    # ---------------------------------------------------------- deployments
+    def add_deployment(self, dep_id: str, room: str, node_id: str, app_id: str) -> None:
+        self.execute(
+            "INSERT INTO deployments (id, room, node_id, app_id, status, created_at) VALUES (?, ?, ?, ?, 'starting', ?)",
+            (dep_id, room, node_id, app_id, time.time()),
+        )
+
+    def update_deployment(self, dep_id: str, status: str, url: Optional[str], detail: str) -> None:
+        self.execute("UPDATE deployments SET status=?, url=COALESCE(?, url), detail=? WHERE id=?", (status, url, detail, dep_id))
+
+    def get_deployment(self, dep_id: str) -> Optional[Dict[str, Any]]:
+        return self.one("SELECT * FROM deployments WHERE id=?", (dep_id,))
+
+    def list_deployments(self, room: str) -> List[Dict[str, Any]]:
+        return self.query("SELECT * FROM deployments WHERE room=? ORDER BY created_at DESC", (room,))

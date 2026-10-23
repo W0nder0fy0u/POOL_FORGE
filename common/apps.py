@@ -1,39 +1,54 @@
-"""PoolForge Allow-Listed Edge Application Catalog.
+"""Allow-list of apps the Deploy tab may run on a pool node.
 
-Security Rule: Only allow-listed pre-approved applications may be launched by agents.
-Arbitrary shell execution over the network is strictly prohibited.
+Security rule: the network can only ever say "run app X" where X is a key of
+APPS. Agents look the id up here; there is no way to send a command line,
+image name or script from the dashboard. To offer a new app, edit this file
+(on the agent machines) and restart the agents.
+
+Two kinds of apps:
+  * "sample": a small sample app shipped in deploy/sample_apps/, started as
+              a Python subprocess (works without Docker).
+  * "docker": an allow-listed public image, run with `docker run`.
 """
 
 from typing import Any, Dict, List
 
-ALLOW_LISTED_APPS: Dict[str, Dict[str, Any]] = {
+APPS: Dict[str, Dict[str, Any]] = {
     "static_site": {
-        "id": "static_site",
-        "name": "Static Portfolio & Showcase Site",
-        "description": "Zero-dependency lightweight HTTP static file server.",
-        "default_port": 8080,
-        "entrypoint_type": "python_module",
-        "module": "http.server",
-        "docker_image": "python:3.11-alpine",
+        "name": "Static website",
+        "description": "Sample static site (deploy/sample_apps/static_site), served by Python.",
+        "kind": "sample",
+        "sample": "static_site",
     },
-    "flask_api": {
-        "id": "flask_api",
-        "name": "Flask Microservice API",
-        "description": "REST API service returning node health and cluster status.",
-        "default_port": 5000,
-        "entrypoint_type": "python_script",
-        "script_path": "deploy/sample_apps/flask_app/app.py",
-        "docker_image": "python:3.11-slim",
+    "flask_app": {
+        "name": "Flask web app",
+        "description": "Sample Flask app (deploy/sample_apps/flask_app); needs `pip install flask` on the node.",
+        "kind": "sample",
+        "sample": "flask_app",
+    },
+    "nginx": {
+        "name": "Nginx (Docker)",
+        "description": "Official nginx:1.27-alpine image serving its welcome page.",
+        "kind": "docker",
+        "image": "nginx:1.27-alpine",
+        "container_port": 80,
+    },
+    "whoami": {
+        "name": "whoami (Docker)",
+        "description": "traefik/whoami:v1.10 - tiny server that echoes request info.",
+        "kind": "docker",
+        "image": "traefik/whoami:v1.10",
+        "container_port": 80,
     },
 }
 
 
-def get_allow_listed_app(app_id: str) -> Dict[str, Any]:
-    """Retrieve app configuration if allow-listed; otherwise raise PermissionError."""
-    app_cfg = ALLOW_LISTED_APPS.get(app_id)
-    if not app_cfg:
-        allowed = list(ALLOW_LISTED_APPS.keys())
-        raise PermissionError(
-            f"Unauthorized app '{app_id}'. Only allow-listed apps may be deployed: {allowed}"
-        )
-    return app_cfg
+def get_app(app_id: str) -> Dict[str, Any]:
+    """Return the app config, or raise PermissionError if it isn't allow-listed."""
+    if app_id not in APPS:
+        raise PermissionError(f"App '{app_id}' is not allow-listed. Allowed: {sorted(APPS)}")
+    return APPS[app_id]
+
+
+def catalog() -> List[Dict[str, Any]]:
+    return [{"app_id": k, "name": v["name"], "description": v["description"], "kind": v["kind"]} for k, v in APPS.items()]

@@ -94,6 +94,7 @@ class PipelineStage:
         seed: int = 0,
         encrypt_key: Optional[bytes] = None,
         checkpoint_dir: str = "./checkpoints",
+        attempt: int = 0,
     ):
         self.stage_index = stage_index
         self.num_stages = num_stages
@@ -103,8 +104,11 @@ class PipelineStage:
         self.transport = transport
         self.prev_node, self.next_node = prev_node, next_node
         self.job_id = job_id
+        # Frames are tagged "<job>#<attempt>". After a node drop the job restarts
+        # with attempt+1, so frames still in flight from the old attempt are ignored.
+        self.frame_tag = f"{job_id}#{attempt}"
         self.key = encrypt_key
-        self.mailbox = Mailbox(transport, job_id, encrypt_key)
+        self.mailbox = Mailbox(transport, self.frame_tag, encrypt_key)
         self.checkpoint_dir = Path(checkpoint_dir) / job_id
 
         # Build ONLY this stage's layers. The full model never exists on one node.
@@ -116,7 +120,7 @@ class PipelineStage:
         return sum(p.numel() for p in self.layers.parameters())
 
     async def _send(self, target: str, tensor: torch.Tensor, kind: str, step: int, mb: int) -> None:
-        frame = serialize_tensor(tensor, kind=kind, job_id=self.job_id, step=step, microbatch=mb, encrypt_key=self.key)
+        frame = serialize_tensor(tensor, kind=kind, job_id=self.frame_tag, step=step, microbatch=mb, encrypt_key=self.key)
         await self.transport.send(target, frame)
 
     async def train_step(
@@ -126,7 +130,12 @@ class PipelineStage:
         y: Optional[torch.Tensor] = None,
         microbatches: int = 1,
     ) -> Optional[float]:
-        """Run one full training step. Returns the loss on the last stage, else None."""
+        """Run one full training step. Returns the loss on the last stage, else None.
+
+        Heavy maths runs via asyncio.to_thread so the event loop stays free to
+        answer heartbeats and receive frames while a big layer is computing.
+        """
+        run = asyncio.to_thread
         self.layers.train()
         if self.optimizer:
             self.optimizer.zero_grad()
@@ -143,11 +152,11 @@ class PipelineStage:
         for m in range(microbatches):
             if self.is_first:
                 inp, labels = None, ys[m]
-                out = self.layers(xs[m])
+                out = await run(self.layers, xs[m])
             else:
                 inp = (await self.mailbox.get("activation", step, m)).requires_grad_()
                 labels = await self.mailbox.get("labels", step, m)
-                out = self.layers(inp)
+                out = await run(self.layers, inp)
 
             if self.is_last:
                 # Divide by M so the summed gradients equal those of the full batch.
@@ -163,16 +172,16 @@ class PipelineStage:
         for m in range(microbatches):
             inp, out = saved[m]
             if self.is_last:
-                out.backward()  # `out` is the loss here
+                await run(out.backward)  # `out` is the loss here
             else:
                 grad = await self.mailbox.get("gradient", step, m)
                 if out.requires_grad:  # False only for a first stage with no weights
-                    out.backward(grad)
+                    await run(out.backward, grad)
             if not self.is_first:
                 await self._send(self.prev_node, inp.grad, "gradient", step, m)
 
         if self.optimizer:
-            self.optimizer.step()
+            await run(self.optimizer.step)
         return total_loss if self.is_last else None
 
     # ------------------------------ checkpoints ------------------------------

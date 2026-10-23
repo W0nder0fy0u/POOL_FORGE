@@ -1,7 +1,17 @@
-"""PoolForge Worker Agent Core.
+"""The PoolForge agent: what `poolforge join CODE --server URL` runs.
 
-Runs node telemetry monitoring, handles outbound control plane communication with
-exponential backoff, executes pipeline partitions, and reports training metrics.
+Life of an agent:
+  1. POST /api/rooms/CODE/join  -> gets node_id + secret node_token
+  2. opens the relay WebSocket (data plane) and, with --transport tcp, a TCP listener
+  3. opens the control WebSocket and sends stats every 2 s
+  4. obeys messages: assign (train a stage), control (pause/resume/stop),
+     run_app / stop_app (hosting)
+  If the coordinator connection drops, it reconnects with exponential backoff
+  (1, 2, 4, 8, 10, 10 ... seconds). Reports produced while offline are queued
+  and sent after reconnecting. A re-assign after a node drop resumes training
+  from the last checkpoint.
+
+All connections are OUTBOUND from the laptop: no port forwarding needed.
 """
 
 import asyncio
@@ -9,352 +19,247 @@ import json
 import logging
 import platform
 import socket
-import time
-import uuid
-from typing import Any, Dict, Optional
+import urllib.error
+import urllib.request
+from collections import deque
+from pathlib import Path
+from typing import Any, Deque, Dict, Optional
+
 import psutil
-import requests
-import torch
 import websockets
 
-from common.datasets import get_dataloader
-from common.pipeline import PipelineStage
-from common.schemas import AssignJobMessage, NodeTelemetry, StepMetric
+from agent.hosting import AppManager, lan_ip
+from agent.trainer import proc_ram_mb, run_job
+from common.schemas import AssignMsg, ControlMsg, RunAppMsg, StatsMsg, StopAppMsg, coordinator_message_adapter
 from common.transports import DirectTCPTransport, RelayTransport, Transport
-from agent.hosting import AppRunner
 
 logger = logging.getLogger("poolforge.agent")
+GB = 1024 ** 3
 
 
-class AgentWorker:
-    """Distributed worker node executing pipeline parallel partitions."""
+class JoinError(Exception):
+    """The coordinator refused us (bad room, locked room, ...): don't retry forever."""
 
+
+class Agent:
     def __init__(
         self,
-        room_code: str,
-        server_url: str = "http://localhost:8000",
+        room: str,
+        server: str,
         node_id: Optional[str] = None,
         ram_cap_gb: Optional[float] = None,
-        transport_type: str = "relay",
+        transport: str = "relay",
+        advertise_host: Optional[str] = None,
+        tcp_port: int = 0,
         simulate_latency_ms: float = 0.0,
-        device: str = "cpu",
+        encrypt_passphrase: Optional[str] = None,
+        workdir: str = ".",
     ):
-        self.room_code = room_code.upper()
-        self.server_url = server_url.rstrip("/")
-        self.node_id = node_id or f"node_{uuid.uuid4().hex[:6]}"
+        self.room = room.strip().upper()
+        self.server = server.rstrip("/")
+        self.requested_id = node_id
         self.ram_cap_gb = ram_cap_gb
-        self.transport_type = transport_type.lower()
-        self.simulate_latency_ms = simulate_latency_ms
-        self.device = torch.device(device)
+        self.transport_mode = transport
+        self.advertise_host = advertise_host
+        self.tcp_port = tcp_port
+        self.latency = simulate_latency_ms
+        self.workdir = Path(workdir)
+        self.key = None
+        if encrypt_passphrase:
+            from common.crypto import derive_room_key
 
-        self.status = "idle"  # "idle" | "training" | "hosting" | "paused"
-        self._running = False
-        self._ws: Optional[websockets.WebSocketClientProtocol] = None
-        self._active_job_task: Optional[asyncio.Task] = None
-        self._current_stage: Optional[PipelineStage] = None
-        self._direct_tcp: Optional[DirectTCPTransport] = None
-        self._pause_event = asyncio.Event()
-        self._pause_event.set()
-        self.app_runner = AppRunner(self.node_id)
+            self.key = derive_room_key(encrypt_passphrase, self.room)
 
-    def get_telemetry(self) -> NodeTelemetry:
-        """Poll host memory, CPU, and platform details."""
-        vm = psutil.virtual_memory()
-        real_free = vm.available / (1024 ** 3)
-        reported_free = (
-            min(real_free, self.ram_cap_gb) if self.ram_cap_gb else real_free
-        )
+        self.node_id: Optional[str] = None
+        self.token: Optional[str] = None
+        self.tcp_secret = ""
+        self.heartbeat_s = 2.0
+        self.relay: Optional[RelayTransport] = None
+        self.tcp: Optional[DirectTCPTransport] = None
+        self.ws = None
+        self.outbox: Deque[str] = deque(maxlen=5000)  # reports waiting for a connection
+        self._send_lock = asyncio.Lock()
+        self.job_task: Optional[asyncio.Task] = None
+        self.job_id: Optional[str] = None
+        self.gate = asyncio.Event()  # set = job may run, clear = paused
+        self.apps = AppManager(self.report)
+        self.stopped = asyncio.Event()
 
-        tcp_host = "127.0.0.1"
-        tcp_port = self._direct_tcp.listen_port if self._direct_tcp else None
-
-        return NodeTelemetry(
-            node_id=self.node_id,
-            hostname=socket.gethostname(),
-            os_name=platform.system(),
-            ram_total_gb=round(vm.total / (1024 ** 3), 2),
-            ram_free_gb=round(reported_free, 2),
-            cpu_percent=round(psutil.cpu_percent(interval=None), 1),
-            status=self.status,
-            transport_type=self.transport_type,
-            tcp_host=tcp_host,
-            tcp_port=tcp_port,
-        )
-
-    async def start(self) -> None:
-        """Start worker lifecycle: heartbeats and control plane listener with auto-reconnect."""
-        self._running = True
-
-        # Pre-initialize DirectTCP transport if specified
-        if self.transport_type == "tcp":
-            self._direct_tcp = DirectTCPTransport(
-                node_id=self.node_id,
-                host="127.0.0.1",
-                port=0,
-                simulate_latency_ms=self.simulate_latency_ms,
-            )
-            await self._direct_tcp.start()
-
-        # Reconnect loop with exponential backoff (max 10s)
-        backoff = 1.0
-        while self._running:
-            try:
-                await self._connect_and_listen()
-                backoff = 1.0
-            except (websockets.ConnectionClosed, OSError, Exception) as exc:
-                if not self._running:
-                    break
-                logger.warning(
-                    f"Connection lost to coordinator ({exc}). Reconnecting in {backoff:.1f}s..."
-                )
-                await asyncio.sleep(backoff)
-                backoff = min(backoff * 1.5, 10.0)
-
-    async def _connect_and_listen(self) -> None:
-        """Establish WebSocket connection and process incoming control messages."""
-        ws_url = self.server_url
-        if ws_url.startswith("http://"):
-            ws_url = "ws://" + ws_url[7:]
-        elif ws_url.startswith("https://"):
-            ws_url = "wss://" + ws_url[8:]
-
-        endpoint = f"{ws_url}/ws/agent/{self.room_code}/{self.node_id}"
-        async with websockets.connect(endpoint) as ws:
-            self._ws = ws
-            logger.info(f"Agent [{self.node_id}] registered with room {self.room_code}")
-
-            # Send registration
-            await ws.send(
-                json.dumps(
-                    {"type": "register", "telemetry": self.get_telemetry().model_dump()}
-                )
-            )
-
-            # Spawn heartbeat loop
-            heartbeat_task = asyncio.create_task(self._heartbeat_loop(ws))
-
-            try:
-                async for message in ws:
-                    msg = json.loads(message)
-                    mtype = msg.get("type")
-
-                    if mtype == "assign":
-                        payload = msg["payload"]
-                        assign_msg = AssignJobMessage(**payload)
-                        # Cancel existing running job if any
-                        if self._active_job_task and not self._active_job_task.done():
-                            self._active_job_task.cancel()
-                        self._active_job_task = asyncio.create_task(
-                            self._execute_job(assign_msg)
-                        )
-
-                    elif mtype == "stop":
-                        logger.info("Received stop signal from coordinator")
-                        if self._active_job_task and not self._active_job_task.done():
-                            self._active_job_task.cancel()
-                        self.status = "idle"
-
-                    elif mtype == "pause":
-                        logger.info("Received pause signal from coordinator")
-                        self._pause_event.clear()
-                        self.status = "paused"
-
-                    elif mtype == "resume":
-                        logger.info("Received resume signal from coordinator")
-                        self._pause_event.set()
-                        self.status = "training"
-
-                    elif mtype == "run_app":
-                        app_id = msg.get("app_id")
-                        port = msg.get("port")
-                        logger.info(f"Received deploy app command: {app_id}")
-                        app_res = await self.app_runner.start_app(app_id, port)
-                        await ws.send(json.dumps({"type": "app_started", "app_info": app_res}))
-
-                    elif mtype == "stop_app":
-                        app_id = msg.get("app_id")
-                        await self.app_runner.stop_app(app_id)
-                        await ws.send(json.dumps({"type": "app_stopped", "app_id": app_id}))
-
-            finally:
-                heartbeat_task.cancel()
-
-    async def _heartbeat_loop(self, ws: websockets.WebSocketClientProtocol) -> None:
-        """Emit telemetry update every 2 seconds."""
-        while self._running:
-            try:
-                await asyncio.sleep(2.0)
-                telem = self.get_telemetry()
-                await ws.send(
-                    json.dumps({"type": "heartbeat", "telemetry": telem.model_dump()})
-                )
-            except asyncio.CancelledError:
-                break
-            except Exception:
-                break
-
-    async def _execute_job(self, assign: AssignJobMessage) -> None:
-        """Execute assigned pipeline partition training."""
-        self.status = "training"
-        logger.info(
-            f"Starting job {assign.job_id}: stage {assign.stage_index}/{assign.num_stages} "
-            f"(layers [{assign.start_layer}, {assign.end_layer}))"
-        )
-
-        # 1. Setup transport
-        transport: Transport
-        if self.transport_type == "tcp" and self._direct_tcp:
-            transport = self._direct_tcp
-            for p_id, (p_host, p_port) in assign.peer_tcp_addresses.items():
-                if p_id != self.node_id:
-                    self._direct_tcp.register_peer(p_id, p_host, p_port)
-        else:
-            transport = RelayTransport(
-                node_id=self.node_id,
-                relay_url=self.server_url,
-                room_code=self.room_code,
-                simulate_latency_ms=self.simulate_latency_ms,
-            )
-            await transport.start()
-
-        hp = assign.hyperparameters
-        batch_size = hp.get("batch_size", 16)
-        microbatches = hp.get("microbatches", 1)
-        epochs = hp.get("epochs", 1)
-        steps_per_epoch = hp.get("steps_per_epoch", 5)
-        lr = hp.get("learning_rate", 0.05)
-        optim_type = hp.get("optimizer", "sgd")
-        ckpt_interval = hp.get("checkpoint_interval", 5)
-
-        # 2. Build pipeline stage
-        stage = PipelineStage(
-            stage_index=assign.stage_index,
-            num_stages=assign.num_stages,
-            layer_specs=assign.layer_specs,
-            start_layer=assign.start_layer,
-            end_layer=assign.end_layer,
-            transport=transport,
-            prev_node_id=assign.prev_node_id,
-            next_node_id=assign.next_node_id,
-            learning_rate=lr,
-            optimizer_type=optim_type,
-            job_id=assign.job_id,
-        )
-        self._current_stage = stage
-
-        # 3. First stage loads dataset
-        loader = None
-        data_iter = None
-        if stage.is_first:
-            ds_name = hp.get("dataset_name", "synthetic")
-            loader = get_dataloader(
-                dataset_name=ds_name,
-                batch_size=batch_size,
-                num_samples=batch_size * steps_per_epoch * epochs,
-            )
-            data_iter = iter(loader)
-
-        total_steps = epochs * steps_per_epoch
-
+    # ------------------------------------------------------------- joining
+    def _http_join(self) -> Dict[str, Any]:
+        body = json.dumps({"hostname": socket.gethostname()[:100], "os": f"{platform.system()} {platform.release()}"[:100],
+                           "node_id": self.requested_id}).encode()
+        req = urllib.request.Request(f"{self.server}/api/rooms/{self.room}/join", data=body,
+                                     headers={"Content-Type": "application/json"}, method="POST")
         try:
-            for step in range(total_steps):
-                # Check for pause before starting step
-                await self._pause_event.wait()
-                t_start = time.perf_counter()
-                stage.zero_grad()
+            with urllib.request.urlopen(req, timeout=15) as resp:
+                return json.loads(resp.read())
+        except urllib.error.HTTPError as exc:
+            detail = exc.read().decode(errors="replace")
+            try:
+                detail = json.loads(detail)["detail"]
+            except Exception:
+                pass
+            if exc.code in (400, 403, 404, 409, 422):
+                raise JoinError(f"Coordinator refused to join room {self.room}: {detail}")
+            raise ConnectionError(f"HTTP {exc.code}: {detail}")
 
-                x_batch, y_batch = None, None
-                if stage.is_first and data_iter:
-                    try:
-                        x_batch, y_batch = next(data_iter)
-                    except StopIteration:
-                        data_iter = iter(loader)
-                        x_batch, y_batch = next(data_iter)
+    async def join(self) -> None:
+        backoff = 1.0
+        while True:
+            try:
+                data = await asyncio.to_thread(self._http_join)
+                break
+            except (ConnectionError, OSError) as exc:  # coordinator not reachable yet
+                logger.warning("Cannot reach %s (%s); retrying in %.0fs", self.server, exc, backoff)
+                await asyncio.sleep(backoff)
+                backoff = min(backoff * 2, 10.0)
+        self.node_id, self.token = data["node_id"], data["node_token"]
+        self.tcp_secret, self.heartbeat_s = data["tcp_secret"], data["heartbeat_s"]
+        logger.info("Joined room %s as %s", self.room, self.node_id)
 
-                # Microbatch execution
-                m_inputs = (
-                    torch.chunk(x_batch, microbatches)
-                    if x_batch is not None
-                    else [None] * microbatches
-                )
-                m_labels = (
-                    torch.chunk(y_batch, microbatches)
-                    if y_batch is not None
-                    else [None] * microbatches
-                )
+    # ----------------------------------------------------------- reporting
+    def stats(self) -> StatsMsg:
+        vm = psutil.virtual_memory()
+        free = vm.available / GB
+        if self.ram_cap_gb is not None:
+            free = min(free, self.ram_cap_gb)  # pretend to be a smaller laptop
+        if self.job_task and not self.job_task.done():
+            status = "training" if self.gate.is_set() else "paused"
+        else:
+            status = "hosting" if self.apps.apps else "idle"
+        return StatsMsg(
+            type="stats", hostname=socket.gethostname()[:100], os=f"{platform.system()} {platform.release()}"[:100],
+            ram_total_gb=round(vm.total / GB, 2), ram_free_gb=round(free, 3), ram_cap_gb=self.ram_cap_gb,
+            proc_ram_mb=round(proc_ram_mb(), 1), cpu_percent=psutil.cpu_percent(None), status=status,
+            transport=self.transport_mode, tcp_host=(self.advertise_host or lan_ip()) if self.tcp else None,
+            tcp_port=self.tcp.port if self.tcp else None,
+            docker=self.apps.has_docker, cloudflared=self.apps.has_cloudflared,
+        )
 
-                step_loss = 0.0
+    async def report(self, msg: Any) -> None:
+        """Send a message to the coordinator, or queue it while disconnected.
 
-                # Forward microbatches
-                for m_idx in range(microbatches):
-                    loss_m = await stage.forward_step(
-                        x=m_inputs[m_idx],
-                        labels=m_labels[m_idx],
-                        step=step,
-                        microbatch=m_idx,
-                    )
-                    if loss_m is not None:
-                        step_loss += loss_m / microbatches
+        Stats are not queued (old RAM numbers are useless); training reports are,
+        so no step or checkpoint is lost during a short disconnect.
+        """
+        if isinstance(msg, StatsMsg) and self.ws is None:
+            return
+        self.outbox.append(msg.model_dump_json())
+        await self._flush()
 
-                # Backward microbatches
-                for m_idx in range(microbatches):
-                    await stage.backward_step(
-                        step=step,
-                        microbatch=m_idx,
-                        loss_scale=1.0 / microbatches,
-                    )
+    async def _flush(self) -> None:
+        async with self._send_lock:  # one sender at a time keeps messages in order
+            while self.outbox and self.ws is not None:
+                try:
+                    await self.ws.send(self.outbox[0])
+                    self.outbox.popleft()
+                except Exception:
+                    return
 
-                stage.step_optimizer()
-                step_time_ms = (time.perf_counter() - t_start) * 1000.0
-                throughput = (
-                    batch_size / (step_time_ms / 1000.0) if step_time_ms > 0 else 0.0
-                )
+    async def _heartbeat(self) -> None:
+        while True:
+            await self.report(self.stats())
+            await asyncio.sleep(self.heartbeat_s)
 
-                # Checkpoint
-                if (step + 1) % ckpt_interval == 0:
-                    stage.save_checkpoint(step + 1)
-
-                # Last stage reports metric to Coordinator
-                if stage.is_last:
-                    metric = StepMetric(
-                        job_id=assign.job_id,
-                        step=step + 1,
-                        epoch=(step // steps_per_epoch) + 1,
-                        loss=round(step_loss, 4),
-                        step_time_ms=round(step_time_ms, 2),
-                        throughput_samples_sec=round(throughput, 2),
-                        network_latency_ms=self.simulate_latency_ms,
-                    )
-                    try:
-                        requests.post(
-                            f"{self.server_url}/api/rooms/{self.room_code}/report_metric",
-                            json=metric.model_dump(),
-                            timeout=2.0,
-                        )
-                    except Exception as e:
-                        logger.warning(f"Failed to post metric: {e}")
-
-                logger.info(
-                    f"Step {step+1}/{total_steps} completed in {step_time_ms:.1f}ms "
-                    + (f"(loss: {step_loss:.4f})" if stage.is_last else "")
-                )
-
-        except asyncio.CancelledError:
-            logger.info(f"Job {assign.job_id} cancelled")
-        except Exception as e:
-            logger.error(f"Error during job execution: {e}", exc_info=True)
+    # ----------------------------------------------------------- main loop
+    async def run(self) -> None:
+        await self.join()
+        self.relay = RelayTransport(self.node_id, self.server, self.room, self.token, self.latency)
+        await self.relay.start()
+        if self.transport_mode == "tcp":
+            self.tcp = DirectTCPTransport(self.node_id, "0.0.0.0", self.tcp_port, self.tcp_secret, self.latency)
+            await self.tcp.start()
+        heartbeat = asyncio.create_task(self._heartbeat())
+        try:
+            await self._control_loop()
         finally:
-            if self.transport_type != "tcp":
-                await transport.stop()
-            self.status = "idle"
-            logger.info(f"Job {assign.job_id} finished")
+            heartbeat.cancel()
+            await self.shutdown()
 
-    async def stop(self) -> None:
-        """Gracefully terminate worker."""
-        self._running = False
-        if self._active_job_task and not self._active_job_task.done():
-            self._active_job_task.cancel()
-        if self._direct_tcp:
-            await self._direct_tcp.stop()
-        if self._ws:
-            await self._ws.close()
+    async def _control_loop(self) -> None:
+        base = self.server.replace("https://", "wss://", 1).replace("http://", "ws://", 1)
+        backoff = 1.0
+        while not self.stopped.is_set():
+            url = f"{base}/ws/agent/{self.room}/{self.node_id}?token={self.token}"
+            try:
+                async with websockets.connect(url, max_size=8 * 1024 * 1024, ping_interval=20) as ws:
+                    self.ws = ws
+                    backoff = 1.0
+                    logger.info("Connected to coordinator %s", self.server)
+                    await self.report(self.stats())
+                    async for raw in ws:
+                        await self._handle(raw)
+            except websockets.InvalidStatus as exc:
+                # 403 = our token is no longer valid (e.g. coordinator database reset): join again.
+                logger.warning("Coordinator rejected our connection (%s); re-joining", exc)
+                await self.join()
+                self.relay.url = self.relay.url.rsplit("token=", 1)[0] + f"token={self.token}"
+            except (OSError, websockets.ConnectionClosed, asyncio.TimeoutError) as exc:
+                logger.warning("Lost coordinator connection (%s); reconnecting in %.0fs", exc, backoff)
+            finally:
+                self.ws = None
+            if self.stopped.is_set():
+                break
+            await asyncio.sleep(backoff)
+            backoff = min(backoff * 2, 10.0)
+
+    async def _handle(self, raw: str) -> None:
+        try:
+            msg = coordinator_message_adapter.validate_json(raw)
+        except Exception as exc:
+            logger.warning("Ignoring invalid message from coordinator: %s", exc)
+            return
+        if isinstance(msg, AssignMsg):
+            await self._start_job(msg)
+        elif isinstance(msg, ControlMsg):
+            if msg.job_id != self.job_id:
+                return
+            if msg.action == "pause":
+                self.gate.clear()
+                logger.info("Paused (%s)", msg.reason)
+            elif msg.action == "resume":
+                self.gate.set()
+                logger.info("Resumed")
+            else:
+                logger.info("Stopping job (%s)", msg.reason)
+                await self._cancel_job()
+        elif isinstance(msg, RunAppMsg):
+            asyncio.create_task(self.apps.start(msg.deployment_id, msg.app_id))
+        elif isinstance(msg, StopAppMsg):
+            asyncio.create_task(self.apps.stop(msg.deployment_id))
+
+    def _transport_for(self, msg: AssignMsg) -> Transport:
+        if msg.transport == "tcp" and self.tcp is not None:
+            for nid, (host, port) in msg.peers.items():
+                if nid != self.node_id and host and port:
+                    self.tcp.register_peer(nid, host, int(port))
+            return self.tcp
+        return self.relay
+
+    async def _cancel_job(self) -> None:
+        if self.job_task and not self.job_task.done():
+            self.job_task.cancel()
+            try:
+                await self.job_task
+            except (asyncio.CancelledError, Exception):
+                pass
+        self.job_task = None
+
+    async def _start_job(self, msg: AssignMsg) -> None:
+        await self._cancel_job()  # a re-assign replaces the running attempt
+        self.job_id = msg.job_id
+        self.gate.set()
+        transport = self._transport_for(msg)
+        self.job_task = asyncio.create_task(
+            run_job(msg, transport, self.report, self.gate, self.key,
+                    str(self.workdir / "checkpoints"), str(self.workdir / "data"))
+        )
+
+    async def shutdown(self) -> None:
+        self.stopped.set()
+        await self._cancel_job()
+        await self.apps.stop_all()
+        for t in (self.relay, self.tcp):
+            if t:
+                await t.stop()

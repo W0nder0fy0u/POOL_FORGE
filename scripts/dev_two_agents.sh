@@ -1,75 +1,53 @@
 #!/usr/bin/env bash
-# PoolForge Local Multi-Agent Simulation
-# Launches 1 Coordinator + 2 Agents with different RAM caps on a single machine
+# Run a whole pool on ONE machine: coordinator + 2 agents with different RAM caps.
+#
+#   bash scripts/dev_two_agents.sh            # just start everything
+#   bash scripts/dev_two_agents.sh --train    # ...and start a training job via one API call
+#
+# Agent A pretends to have 1 GB free RAM, agent B 2 GB (--ram-cap-gb), so the
+# scheduler gives B about twice as many layers. Press Ctrl+C to stop everything.
+set -euo pipefail
+cd "$(dirname "$0")/.."
 
-set -e
+PORT="${PORT:-8000}"
+URL="http://127.0.0.1:${PORT}"
+PY=".venv/bin/python"
+[ -x "$PY" ] || PY="python3"
+mkdir -p run
 
-PORT=8000
-SERVER_URL="http://127.0.0.1:${PORT}"
-VENV_PY="./.venv/bin/python"
+pids=()
+cleanup() { echo; echo "Stopping..."; kill "${pids[@]}" 2>/dev/null || true; wait 2>/dev/null || true; }
+trap cleanup EXIT INT TERM
 
-if [ ! -f "$VENV_PY" ]; then
-    VENV_PY="python3"
+echo "== Starting coordinator on $URL (log: run/coordinator.log)"
+POOLFORGE_PORT="$PORT" "$PY" -m coordinator.server > run/coordinator.log 2>&1 &
+pids+=($!)
+for _ in $(seq 1 60); do curl -sf "$URL/health" >/dev/null && break; sleep 0.5; done
+curl -sf "$URL/health" >/dev/null || { echo "Coordinator did not start; see run/coordinator.log"; exit 1; }
+
+ROOM_JSON=$(curl -sf -X POST "$URL/api/rooms")
+CODE=$("$PY" -c 'import json,sys; print(json.load(sys.stdin)["room_code"])' <<< "$ROOM_JSON")
+TOKEN=$("$PY" -c 'import json,sys; print(json.load(sys.stdin)["admin_token"])' <<< "$ROOM_JSON")
+
+echo "== Starting agent laptop-a (1 GB cap) and laptop-b (2 GB cap) (logs: run/agent-*.log)"
+"$PY" -m agent.cli join "$CODE" --server "$URL" --node-id laptop-a --ram-cap-gb 1 --workdir run/a > run/agent-a.log 2>&1 &
+pids+=($!)
+"$PY" -m agent.cli join "$CODE" --server "$URL" --node-id laptop-b --ram-cap-gb 2 --workdir run/b > run/agent-b.log 2>&1 &
+pids+=($!)
+sleep 4
+
+echo
+echo "  Room code   : $CODE"
+echo "  Admin token : $TOKEN"
+echo "  Dashboard   : $URL/room/$CODE#admin=$TOKEN"
+echo "  Join link   : $URL/join/$CODE"
+echo
+
+if [[ "${1:-}" == "--train" ]]; then
+  echo "== Starting training with ONE API call (mnist_cnn, auto split)"
+  curl -sf -X POST "$URL/api/rooms/$CODE/jobs" -H "X-Admin-Token: $TOKEN" -H "Content-Type: application/json" \
+    -d '{"model":"mnist_cnn","batch_size":64,"epochs":1,"steps_per_epoch":100}' | "$PY" -m json.tool
 fi
 
-echo "=========================================================="
-echo " Starting PoolForge Coordinator on ${SERVER_URL}..."
-echo "=========================================================="
-
-# Start coordinator in background
-$VENV_PY -m coordinator.server &
-COORD_PID=$!
-
-# Trap cleanup to terminate child processes on exit
-cleanup() {
-    echo ""
-    echo "Terminating Coordinator and Agents..."
-    kill $COORD_PID 2>/dev/null || true
-    kill $AGENT1_PID 2>/dev/null || true
-    kill $AGENT2_PID 2>/dev/null || true
-    exit 0
-}
-trap cleanup SIGINT SIGTERM EXIT
-
-# Wait for coordinator to start listening
-echo "Waiting for Coordinator..."
-for i in {1..20}; do
-    if curl -s "${SERVER_URL}/docs" > /dev/null 2>&1; then
-        echo "Coordinator is ready!"
-        break
-    fi
-    sleep 0.5
-done
-
-# Create a test room
-ROOM_RESP=$(curl -s -X POST "${SERVER_URL}/api/rooms")
-ROOM_CODE=$(echo $ROOM_RESP | $VENV_PY -c "import sys, json; print(json.load(sys.stdin)['room_code'])")
-ADMIN_TOKEN=$(echo $ROOM_RESP | $VENV_PY -c "import sys, json; print(json.load(sys.stdin)['admin_token'])")
-
-echo "Created Pool Room: ${ROOM_CODE}"
-echo "Admin Token:      ${ADMIN_TOKEN}"
-echo "Join URL:         ${SERVER_URL}/join/${ROOM_CODE}"
-echo ""
-
-# Launch Agent 1 (Capped at 1.0 GB RAM)
-echo "Starting Agent 1 (Capped at 1.0 GB RAM)..."
-$VENV_PY agent/cli.py join "$ROOM_CODE" --server "$SERVER_URL" --node-id "laptop-alpha" --ram-cap-gb 1.0 &
-AGENT1_PID=$!
-
-# Launch Agent 2 (Capped at 2.0 GB RAM)
-echo "Starting Agent 2 (Capped at 2.0 GB RAM)..."
-$VENV_PY agent/cli.py join "$ROOM_CODE" --server "$SERVER_URL" --node-id "laptop-beta" --ram-cap-gb 2.0 &
-AGENT2_PID=$!
-
-sleep 2
-echo ""
-echo "Both agents joined! Inspect room state:"
-curl -s "${SERVER_URL}/api/rooms/${ROOM_CODE}" | $VENV_PY -m json.tool
-
-echo ""
-echo "To trigger distributed training, execute:"
-echo "curl -X POST \"${SERVER_URL}/api/rooms/${ROOM_CODE}/start\" -H \"X-Admin-Token: ${ADMIN_TOKEN}\" -H \"Content-Type: application/json\" -d '{\"model_name\":\"tiny_test\",\"epochs\":1,\"steps_per_epoch\":5}'"
-echo ""
-echo "Press Ctrl+C to stop all processes."
-
-wait $COORD_PID
+echo "Open the dashboard link above. Press Ctrl+C to stop."
+wait

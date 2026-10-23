@@ -1,691 +1,459 @@
-"""PoolForge Coordinator Server.
+"""PoolForge coordinator: FastAPI REST + WebSockets + tensor relay + dashboard.
 
-FastAPI REST API + WebSocket Control Plane + Binary Tensor Relay.
-Serves dashboard static files and orchestrates distributed model training.
+One process (one Docker container) serves everything:
+
+  REST        /api/...                        rooms, join, jobs, deployments, exports
+  WebSocket   /ws/agent/{room}/{node}?token   control plane (small JSON messages)
+  WebSocket   /ws/relay/{room}/{node}?token   data plane (binary tensor frames)
+  WebSocket   /ws/dashboard/{room}            live events for the browser
+  Static      /                               the built React dashboard
+
+Run:  python -m coordinator.server     (or: uvicorn coordinator.server:app)
 """
 
 import asyncio
+import csv
+import hmac
+import io
 import json
 import logging
+import os
+import re
 import secrets
 import string
 import struct
 import time
+from contextlib import asynccontextmanager
 from pathlib import Path
-from typing import Any, Dict, Optional, Set
-from fastapi import FastAPI, HTTPException, Header, Query, Request, WebSocket, WebSocketDisconnect
-from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse
-from fastapi.staticfiles import StaticFiles
+from typing import Optional
 
-from common.model_zoo import get_model_specs
+from fastapi import Depends, FastAPI, Header, Request, WebSocket, WebSocketDisconnect
+from fastapi.responses import FileResponse, JSONResponse, PlainTextResponse
+from pydantic import ValidationError
+
+from common import __version__
+from common.apps import catalog as app_catalog
+from common.apps import get_app
+from common.model_zoo import catalog as model_catalog
 from common.schemas import (
-    AssignJobMessage,
-    CreateRoomResponse,
-    NodeTelemetry,
-    RoomStatus,
-    StartTrainingRequest,
-    StepMetric,
+    ROOM_CODE_PATTERN,
+    AppStateMsg,
+    CheckpointMsg,
+    DeployRequest,
+    JobStateMsg,
+    JoinRequest,
+    JoinResponse,
+    LockRequest,
+    RunAppMsg,
+    StatsMsg,
+    StepMsg,
+    StopAppMsg,
+    TrainingConfig,
+    agent_message_adapter,
 )
-from coordinator.db import CoordinatorDB
-from coordinator.scheduler import schedule_pipeline_split
+from coordinator.db import DB, hash_token
+from coordinator.hub import ApiError, Hub, NodeLive, RateLimiter, Room
 
 logger = logging.getLogger("poolforge.coordinator")
-logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(name)s: %(message)s")
 
-app = FastAPI(title="PoolForge Coordinator", version="0.1.0")
-
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
-
-# Initialize Database
-db = CoordinatorDB("poolforge.db")
-
-# Active WebSocket connections
-# (room_code, node_id) -> WebSocket
-agent_sockets: Dict[tuple[str, str], WebSocket] = {}
-# (room_code, node_id) -> WebSocket
-relay_sockets: Dict[tuple[str, str], WebSocket] = {}
-# room_code -> Set[WebSocket]
-dashboard_sockets: Dict[str, Set[WebSocket]] = {}
-
-UINT32_STRUCT = struct.Struct(">I")
-
-# In-memory active job tracker: room_code -> job_id
-active_room_jobs: Dict[str, str] = {}
-# Active job metadata: job_id -> dict
-job_registry: Dict[str, Dict[str, Any]] = {}
-# Drop grace timers: (room_code, node_id) -> asyncio.Task
-node_drop_tasks: Dict[tuple[str, str], asyncio.Task] = {}
-# Deployed edge apps registry: app_id -> metadata dict
-deployed_apps_registry: Dict[str, Dict[str, Any]] = {}
-
-# Simple in-memory rate limiter: ip -> list of timestamps
-rate_limit_history: Dict[str, list[float]] = {}
+DIST_DIR = Path(__file__).resolve().parent.parent / "dashboard" / "dist"
+MAX_RELAY_FRAME = 600 * 1024 * 1024
+UINT32 = struct.Struct(">I")  # same 4-byte length prefix as common/protocol.py (kept here so no torch import)
+ROOM_RE = re.compile(ROOM_CODE_PATTERN)
 
 
-def check_rate_limit(client_ip: str, max_requests: int = 20, window_seconds: float = 10.0) -> None:
-    """Enforce request rate limiting per IP address."""
-    now = time.time()
-    history = rate_limit_history.get(client_ip, [])
-    # Filter within window
-    history = [t for t in history if now - t < window_seconds]
-    if len(history) >= max_requests:
-        raise HTTPException(
-            status_code=429,
-            detail=f"Rate limit exceeded: max {max_requests} requests per {window_seconds}s",
-        )
-    history.append(now)
-    rate_limit_history[client_ip] = history
+def create_app(db_path: Optional[str] = None, drop_grace_s: Optional[float] = None) -> FastAPI:
+    """Build the app. Tests call this to get a fresh coordinator with its own DB."""
+    db = DB(db_path or os.environ.get("POOLFORGE_DB_PATH", "data/poolforge.db"))
+    hub = Hub(db, drop_grace_s=drop_grace_s if drop_grace_s is not None else float(os.environ.get("POOLFORGE_DROP_GRACE_S", 30)))
+    create_limiter = RateLimiter(limit=10, window=60)  # rooms created per IP per minute
+    join_limiter = RateLimiter(limit=20, window=60)  # join attempts per IP per minute
 
+    @asynccontextmanager
+    async def lifespan(_app: FastAPI):
+        async def sweeper():
+            while True:
+                await asyncio.sleep(hub.heartbeat_s)
+                try:
+                    await hub.sweep()
+                except Exception:
+                    logger.exception("sweeper error")
 
-def generate_room_code(length: int = 6) -> str:
-    """Generate random uppercase/numeric 6-character room code."""
-    chars = string.ascii_uppercase + string.digits
-    return "".join(secrets.choice(chars) for _ in range(length))
+        task = asyncio.create_task(sweeper())
+        yield
+        task.cancel()
 
+    app = FastAPI(title="PoolForge Coordinator", version=__version__, lifespan=lifespan)
+    app.state.hub = hub
+    app.state.db = db
 
-async def broadcast_to_dashboard(room_code: str, message: Dict[str, Any]) -> None:
-    """Broadcast JSON event to all connected dashboard clients for this room."""
-    clients = dashboard_sockets.get(room_code, set())
-    if not clients:
-        return
-    text = json.dumps(message)
-    dead_clients = set()
-    for ws in list(clients):
+    @app.exception_handler(ApiError)
+    async def api_error(_req: Request, exc: ApiError):
+        return JSONResponse({"detail": exc.detail}, status_code=exc.status)
+
+    # ------------------------------------------------------------ helpers
+    def client_ip(request: Request) -> str:
+        # Behind Render/Railway the real client is the first X-Forwarded-For entry.
+        fwd = request.headers.get("x-forwarded-for")
+        return fwd.split(",")[0].strip() if fwd else (request.client.host if request.client else "?")
+
+    def public_url(request: Request) -> str:
+        env = os.environ.get("POOLFORGE_PUBLIC_URL", "").rstrip("/")
+        if env:
+            return env
+        proto = request.headers.get("x-forwarded-proto", request.url.scheme)
+        return f"{proto}://{request.headers.get('host', 'localhost:8000')}"
+
+    def get_room(code: str) -> Room:
+        if not ROOM_RE.match(code):
+            raise ApiError(404, "Invalid room code")
+        return hub.room(code)
+
+    def require_admin(code: str, x_admin_token: str = Header(default="")) -> Room:
+        """FastAPI dependency: the request must carry the room's admin token."""
+        room = get_room(code)
+        stored = db.get_room(code)["admin_hash"]
+        if not hmac.compare_digest(stored, hash_token(x_admin_token)):
+            raise ApiError(403, "Admin token missing or wrong")
+        return room
+
+    def node_auth(code: str, node_id: str, token: str) -> Optional[NodeLive]:
+        """Check a node's token for WebSocket connections."""
+        if not ROOM_RE.match(code):
+            return None
+        row = db.get_node(code, node_id)
+        if not row or not hmac.compare_digest(row["token_hash"], hash_token(token)):
+            return None
+        room = hub.room(code)
+        if node_id not in room.nodes:
+            room.nodes[node_id] = NodeLive(node_id, row["hostname"], row["os"])
+        return room.nodes[node_id]
+
+    # --------------------------------------------------------------- REST
+    @app.get("/health")
+    async def health():
+        return {"status": "ok", "version": __version__}
+
+    @app.get("/api/models")
+    async def models():
+        return model_catalog()
+
+    @app.get("/api/apps")
+    async def apps():
+        return app_catalog()
+
+    @app.post("/api/rooms")
+    async def create_room(request: Request):
+        if not create_limiter.allow(client_ip(request)):
+            raise ApiError(429, "Too many rooms created from your IP; wait a minute")
+        alphabet = string.ascii_uppercase + string.digits
+        while True:
+            code = "".join(secrets.choice(alphabet) for _ in range(6))
+            if not db.get_room(code):
+                break
+        admin_token = secrets.token_urlsafe(24)
+        db.create_room(code, admin_token)
+        base = public_url(request)
+        logger.info("Created room %s", code)
+        return {
+            "room_code": code,
+            "admin_token": admin_token,
+            "join_url": f"{base}/join/{code}",
+            "join_command": f"poolforge join {code} --server {base}",
+        }
+
+    @app.get("/api/rooms/{code}")
+    async def room_info(code: str, request: Request):
+        room = get_room(code)
+        snap = hub.snapshot(room)
+        snap["join_command"] = f"poolforge join {code} --server {public_url(request)}"
+        snap["server"] = public_url(request)
+        return snap
+
+    @app.post("/api/rooms/{code}/join", response_model=JoinResponse)
+    async def join(code: str, body: JoinRequest, request: Request):
+        """An agent asks to join. It gets a node id + a secret node token."""
+        if not join_limiter.allow(client_ip(request)):
+            raise ApiError(429, "Too many join attempts; wait a minute")
+        room = get_room(code)
+        if db.get_room(code)["locked"]:
+            raise ApiError(403, "This pool is locked by its admin; no new nodes can join")
+        node_id = body.node_id or f"node-{secrets.token_hex(3)}"
+        existing = room.nodes.get(node_id)
+        if existing is not None and existing.ws is not None:
+            raise ApiError(409, f"Node id '{node_id}' is already online in this room")
+        token = secrets.token_urlsafe(24)
+        db.add_node(code, node_id, token, body.hostname, body.os)
+        room.nodes[node_id] = NodeLive(node_id, body.hostname, body.os)
+        # Per-room TCP secret, derived so we don't have to store it.
+        tcp_secret = hash_token(db.get_room(code)["admin_hash"] + ":tcp")[:32]
+        logger.info("Node %s (%s) joined room %s", node_id, body.hostname, code)
+        return JoinResponse(node_id=node_id, node_token=token, tcp_secret=tcp_secret, heartbeat_s=hub.heartbeat_s)
+
+    @app.post("/api/rooms/{code}/admin/check")
+    async def admin_check(room: Room = Depends(require_admin)):
+        return {"ok": True, "room": room.code}
+
+    @app.post("/api/rooms/{code}/lock")
+    async def lock(body: LockRequest, room: Room = Depends(require_admin)):
+        db.set_locked(room.code, body.locked)
+        await hub.broadcast(room, {"type": "locked", "locked": body.locked})
+        return {"locked": body.locked}
+
+    @app.post("/api/rooms/{code}/plan")
+    async def preview_plan(cfg: TrainingConfig, room: Room = Depends(require_admin)):
+        """Show how the model would be split, without starting anything."""
+        model, dataset, plan, transport = hub.make_plan(room, cfg)
+        return {"plan": plan, "transport": transport, "dataset": dataset,
+                "num_layers": len(model["specs"]), "layer_types": [s["type"] for s in model["specs"]]}
+
+    @app.post("/api/rooms/{code}/jobs")
+    async def start_job(cfg: TrainingConfig, room: Room = Depends(require_admin)):
+        job = await hub.start_job(room, cfg)
+        return job.public()
+
+    @app.post("/api/rooms/{code}/jobs/{job_id}/{action}")
+    async def job_action(job_id: str, action: str, room: Room = Depends(require_admin)):
+        if action not in ("pause", "resume", "stop"):
+            raise ApiError(404, "Unknown action")
+        job = await hub.control(room, job_id, action)
+        return job.public()
+
+    @app.get("/api/rooms/{code}/jobs")
+    async def list_jobs(code: str):
+        get_room(code)
+        return db.list_jobs(code)
+
+    @app.get("/api/rooms/{code}/jobs/{job_id}")
+    async def job_detail(code: str, job_id: str):
+        get_room(code)
+        job = db.get_job(job_id)
+        if not job or job["room"] != code:
+            raise ApiError(404, "Job not found")
+        job["metrics"] = db.job_metrics(job_id)
+        job["node_metrics"] = db.job_node_metrics(job_id)
+        return job
+
+    @app.get("/api/rooms/{code}/jobs/{job_id}/export")
+    async def export(code: str, job_id: str, format: str = "csv"):
+        """Reports page: download a run's per-step results."""
+        job = await job_detail(code, job_id)
+        if format == "json":
+            return JSONResponse(job, headers={"Content-Disposition": f'attachment; filename="{job_id}.json"'})
+        buf = io.StringIO()
+        writer = csv.writer(buf)
+        writer.writerow(["step", "epoch", "loss", "step_time_ms", "samples_per_s", "node_id", "stage",
+                         "bytes_sent", "bytes_received", "avg_send_ms", "proc_ram_mb"])
+        by_step = {}
+        for nm in job["node_metrics"]:
+            by_step.setdefault(nm["step"], []).append(nm)
+        for m in job["metrics"]:
+            for nm in by_step.get(m["step"], [{}]):
+                writer.writerow([m["step"], m["epoch"], m["loss"], round(m["step_time_ms"], 2), round(m["samples_per_s"], 2),
+                                 nm.get("node_id"), nm.get("stage"), nm.get("bytes_sent"), nm.get("bytes_received"),
+                                 nm.get("avg_send_ms"), nm.get("proc_ram_mb")])
+        return PlainTextResponse(buf.getvalue(), media_type="text/csv",
+                                 headers={"Content-Disposition": f'attachment; filename="{job_id}.csv"'})
+
+    # ---------------------------------------------------------- hosting
+    @app.get("/api/rooms/{code}/deployments")
+    async def list_deployments(code: str):
+        get_room(code)
+        return db.list_deployments(code)
+
+    @app.post("/api/rooms/{code}/deployments")
+    async def deploy(body: DeployRequest, room: Room = Depends(require_admin)):
         try:
-            await ws.send_text(text)
-        except Exception:
-            dead_clients.add(ws)
-    for ws in dead_clients:
-        clients.discard(ws)
+            get_app(body.app_id)  # only allow-listed apps
+        except PermissionError as exc:
+            raise ApiError(403, str(exc))
+        online = [n for n in room.nodes.values() if n.ws is not None and n.stats]
+        if body.node_id:
+            node = room.nodes.get(body.node_id)
+            if not node or node.ws is None:
+                raise ApiError(404, f"Node '{body.node_id}' is not online")
+        elif online:
+            node = max(online, key=lambda n: n.stats.get("ram_free_gb", 0))  # most free RAM
+        else:
+            raise ApiError(400, "No online nodes to deploy on")
+        dep_id = f"app-{secrets.token_hex(3)}"
+        db.add_deployment(dep_id, room.code, node.node_id, body.app_id)
+        await hub.send(node, RunAppMsg(type="run_app", deployment_id=dep_id, app_id=body.app_id))
+        await hub.broadcast(room, {"type": "deployment", "deployment": db.get_deployment(dep_id)})
+        return db.get_deployment(dep_id)
 
+    @app.post("/api/rooms/{code}/deployments/{dep_id}/{action}")
+    async def deployment_action(dep_id: str, action: str, room: Room = Depends(require_admin)):
+        dep = db.get_deployment(dep_id)
+        if not dep or dep["room"] != room.code:
+            raise ApiError(404, "Deployment not found")
+        node = room.nodes.get(dep["node_id"])
+        if node is None or node.ws is None:
+            raise ApiError(409, f"Node {dep['node_id']} is offline")
+        if action == "stop":
+            await hub.send(node, StopAppMsg(type="stop_app", deployment_id=dep_id))
+        elif action == "restart":
+            await hub.send(node, StopAppMsg(type="stop_app", deployment_id=dep_id))
+            db.update_deployment(dep_id, "starting", None, "restarting")
+            await hub.send(node, RunAppMsg(type="run_app", deployment_id=dep_id, app_id=dep["app_id"]))
+        else:
+            raise ApiError(404, "Unknown action")
+        return db.get_deployment(dep_id)
 
-# ---------------------------------------------------------
-# REST APIs
-# ---------------------------------------------------------
-
-@app.post("/api/rooms", response_model=CreateRoomResponse)
-async def create_room(request: Request):
-    """Create a new collaborative pool room."""
-    room_code = generate_room_code()
-    admin_token = secrets.token_hex(16)
-    db.create_room(room_code, admin_token)
-
-    host = request.headers.get("host", "localhost:8000")
-    scheme = "https" if request.url.scheme == "https" else "http"
-    join_url = f"{scheme}://{host}/join/{room_code}"
-
-    logger.info(f"Created pool room {room_code}")
-    return CreateRoomResponse(
-        room_code=room_code,
-        admin_token=admin_token,
-        join_url=join_url,
-        created_at=time.time(),
-    )
-
-
-@app.get("/api/rooms/{room_code}", response_model=RoomStatus)
-async def get_room(room_code: str):
-    """Get status and participating nodes for a room."""
-    room = db.get_room(room_code)
-    if not room:
-        raise HTTPException(status_code=404, detail=f"Room '{room_code}' not found")
-
-    nodes = db.get_room_nodes(room_code)
-    active_job = active_room_jobs.get(room_code)
-    return RoomStatus(
-        room_code=room_code,
-        node_count=len(nodes),
-        nodes=nodes,
-        active_job_id=active_job,
-        job_status=room.get("status", "idle"),
-    )
-
-
-@app.post("/api/rooms/{room_code}/start")
-async def start_training(
-    room_code: str,
-    req: StartTrainingRequest,
-    x_admin_token: Optional[str] = Header(None, alias="X-Admin-Token"),
-    admin_token: Optional[str] = Query(None),
-):
-    """Start distributed training across all connected pool nodes."""
-    room = db.get_room(room_code)
-    if not room:
-        raise HTTPException(status_code=404, detail="Room not found")
-
-    token = x_admin_token or admin_token
-    if token != room["admin_token"]:
-        raise HTTPException(status_code=403, detail="Invalid admin token")
-
-    nodes = db.get_room_nodes(room_code)
-    if len(nodes) < 1:
-        raise HTTPException(status_code=400, detail="Cannot start: 0 worker nodes in pool")
-
-    # Load layer specs
-    try:
-        specs = get_model_specs(req.model_name)
-    except KeyError:
-        raise HTTPException(status_code=400, detail=f"Unknown model: {req.model_name}")
-
-    # Compute contiguous pipeline partitioning with memory check
-    try:
-        split_plan = schedule_pipeline_split(specs, nodes, batch_size=req.batch_size)
-    except ValueError as e:
-        raise HTTPException(status_code=400, detail=str(e))
-
-    job_id = f"job_{room_code}_{int(time.time())}"
-    active_room_jobs[room_code] = job_id
-    job_registry[job_id] = {
-        "job_id": job_id,
-        "room_code": room_code,
-        "split_plan": split_plan,
-        "nodes": [s.node_id for s in split_plan],
-        "status": "running",
-        "last_step": 0,
-        "config": req.model_dump(),
-    }
-    db.create_job(job_id, room_code, req.model_name, req.model_dump())
-
-    # Build peer TCP address dictionary for DirectTCP transports
-    peer_tcp_addrs = {}
-    for n in nodes:
-        if n.tcp_host and n.tcp_port:
-            peer_tcp_addrs[n.node_id] = [n.tcp_host, n.tcp_port]
-
-    # Send assign messages to each node's control socket
-    num_stages = len(split_plan)
-    for idx, stage in enumerate(split_plan):
-        prev_id = split_plan[idx - 1].node_id if idx > 0 else None
-        next_id = split_plan[idx + 1].node_id if idx < num_stages - 1 else None
-
-        assign_msg = AssignJobMessage(
-            job_id=job_id,
-            stage_index=idx,
-            num_stages=num_stages,
-            start_layer=stage.start_layer,
-            end_layer=stage.end_layer,
-            layer_specs=specs,
-            prev_node_id=prev_id,
-            next_node_id=next_id,
-            peer_tcp_addresses=peer_tcp_addrs,
-            hyperparameters=req.model_dump(),
-        )
-
-        node_ws = agent_sockets.get((room_code, stage.node_id))
-        if node_ws:
-            await node_ws.send_text(
-                json.dumps({"type": "assign", "payload": assign_msg.model_dump()})
-            )
-
-    await broadcast_to_dashboard(
-        room_code,
-        {
-            "type": "job_started",
-            "job_id": job_id,
-            "split_plan": [s.model_dump() for s in split_plan],
-            "config": req.model_dump(),
-        },
-    )
-
-    return {
-        "status": "started",
-        "job_id": job_id,
-        "split_plan": [s.model_dump() for s in split_plan],
-    }
-
-
-@app.post("/api/rooms/{room_code}/stop")
-async def stop_training(
-    room_code: str,
-    x_admin_token: Optional[str] = Header(None, alias="X-Admin-Token"),
-    admin_token: Optional[str] = Query(None),
-):
-    """Stop currently executing training job."""
-    room = db.get_room(room_code)
-    if not room:
-        raise HTTPException(status_code=404, detail="Room not found")
-
-    token = x_admin_token or admin_token
-    if token != room["admin_token"]:
-        raise HTTPException(status_code=403, detail="Invalid admin token")
-
-    job_id = active_room_jobs.pop(room_code, None)
-    if job_id:
-        db.update_job_status(job_id, "stopped")
-
-    # Broadcast stop to all connected agents
-    for (r_code, node_id), ws in list(agent_sockets.items()):
-        if r_code == room_code:
+    # -------------------------------------------------------- WebSockets
+    @app.websocket("/ws/agent/{code}/{node_id}")
+    async def agent_ws(ws: WebSocket, code: str, node_id: str, token: str = ""):
+        node = node_auth(code, node_id, token)
+        if node is None:
+            await ws.close(code=4403, reason="bad room, node or token")
+            return
+        await ws.accept()
+        room = hub.room(code)
+        if node.ws is not None:  # a stale connection from the same node: replace it
             try:
-                await ws.send_text(json.dumps({"type": "stop", "job_id": job_id}))
+                await node.ws.close()
             except Exception:
                 pass
+        node.ws = ws
+        node.last_seen = time.time()
+        logger.info("Agent %s connected (room %s)", node_id, code)
+        first_stats = True
+        try:
+            while True:
+                text = await ws.receive_text()
+                if len(text) > 64 * 1024:
+                    continue
+                try:
+                    msg = agent_message_adapter.validate_json(text)
+                except ValidationError as exc:
+                    logger.warning("Invalid message from %s: %s", node_id, exc.errors()[:1])
+                    continue
+                node.last_seen = time.time()
+                if isinstance(msg, StatsMsg):
+                    node.stats = msg.model_dump()
+                    await hub.broadcast(room, {"type": "node", "node": node.public()})
+                    if first_stats:  # node is fully "online" once we know its RAM
+                        first_stats = False
+                        await hub.node_online(room, node)
+                elif isinstance(msg, StepMsg):
+                    await hub.on_step(room, node, msg)
+                elif isinstance(msg, CheckpointMsg):
+                    await hub.on_checkpoint(room, msg.job_id, msg.stage, msg.step)
+                elif isinstance(msg, JobStateMsg):
+                    await hub.on_job_state(room, msg)
+                elif isinstance(msg, AppStateMsg):
+                    dep = db.get_deployment(msg.deployment_id)
+                    if dep and dep["node_id"] == node_id:
+                        db.update_deployment(msg.deployment_id, msg.status, msg.url, msg.detail)
+                        await hub.broadcast(room, {"type": "deployment", "deployment": db.get_deployment(msg.deployment_id)})
+        except (WebSocketDisconnect, RuntimeError):
+            pass
+        finally:
+            if node.ws is ws:  # (not if we were replaced by a newer connection)
+                node.ws = None
+                logger.info("Agent %s disconnected", node_id)
+                await hub.node_offline(room, node)
 
-    await broadcast_to_dashboard(room_code, {"type": "job_stopped", "job_id": job_id})
-    return {"status": "stopped", "job_id": job_id}
-
-
-@app.post("/api/rooms/{room_code}/pause")
-async def pause_training(
-    room_code: str,
-    x_admin_token: Optional[str] = Header(None, alias="X-Admin-Token"),
-    admin_token: Optional[str] = Query(None),
-):
-    """Pause currently executing training job."""
-    room = db.get_room(room_code)
-    if not room:
-        raise HTTPException(status_code=404, detail="Room not found")
-
-    token = x_admin_token or admin_token
-    if token != room["admin_token"]:
-        raise HTTPException(status_code=403, detail="Invalid admin token")
-
-    job_id = active_room_jobs.get(room_code)
-    if not job_id:
-        raise HTTPException(status_code=400, detail="No active job to pause")
-
-    if job_id in job_registry:
-        job_registry[job_id]["status"] = "paused"
-    db.update_job_status(job_id, "paused")
-
-    for (r_code, node_id), ws in list(agent_sockets.items()):
-        if r_code == room_code:
-            try:
-                await ws.send_text(json.dumps({"type": "pause", "job_id": job_id}))
-            except Exception:
-                pass
-
-    await broadcast_to_dashboard(room_code, {"type": "job_paused", "job_id": job_id})
-    return {"status": "paused", "job_id": job_id}
-
-
-@app.post("/api/rooms/{room_code}/resume")
-async def resume_training(
-    room_code: str,
-    x_admin_token: Optional[str] = Header(None, alias="X-Admin-Token"),
-    admin_token: Optional[str] = Query(None),
-):
-    """Resume paused training job."""
-    room = db.get_room(room_code)
-    if not room:
-        raise HTTPException(status_code=404, detail="Room not found")
-
-    token = x_admin_token or admin_token
-    if token != room["admin_token"]:
-        raise HTTPException(status_code=403, detail="Invalid admin token")
-
-    job_id = active_room_jobs.get(room_code)
-    if not job_id:
-        raise HTTPException(status_code=400, detail="No active job to resume")
-
-    if job_id in job_registry:
-        job_registry[job_id]["status"] = "running"
-    db.update_job_status(job_id, "running")
-
-    for (r_code, node_id), ws in list(agent_sockets.items()):
-        if r_code == room_code:
-            try:
-                await ws.send_text(json.dumps({"type": "resume", "job_id": job_id}))
-            except Exception:
-                pass
-
-    await broadcast_to_dashboard(room_code, {"type": "job_resumed", "job_id": job_id})
-    return {"status": "resumed", "job_id": job_id}
-
-
-@app.post("/api/rooms/{room_code}/report_metric")
-async def report_metric(room_code: str, metric: StepMetric):
-    """Receive step telemetry emitted by the last pipeline stage."""
-    db.record_metric(
-        job_id=metric.job_id,
-        step=metric.step,
-        epoch=metric.epoch,
-        loss=metric.loss,
-        step_time_ms=metric.step_time_ms,
-        throughput=metric.throughput_samples_sec,
-    )
-    # Broadcast live step metrics to dashboard
-    await broadcast_to_dashboard(
-        room_code,
-        {"type": "step_metric", "payload": metric.model_dump()},
-    )
-    return {"status": "ok"}
-
-
-@app.get("/api/rooms/{room_code}/metrics")
-async def get_metrics(room_code: str, job_id: Optional[str] = None):
-    """Fetch time-series training metrics for dashboard visualization."""
-    target_job = job_id or active_room_jobs.get(room_code)
-    if not target_job:
-        return {"job_id": None, "metrics": []}
-    metrics = db.get_job_metrics(target_job)
-    return {"job_id": target_job, "metrics": metrics}
-
-
-# ---------------------------------------------------------
-# Hosting APIs (Edge Microservice Deployment)
-# ---------------------------------------------------------
-
-@app.post("/api/rooms/{room_code}/deploy")
-async def deploy_app(
-    room_code: str,
-    payload: Dict[str, Any],
-    x_admin_token: Optional[str] = Header(None, alias="X-Admin-Token"),
-    admin_token: Optional[str] = Query(None),
-):
-    """Deploy an allow-listed edge web application onto a pool node."""
-    room = db.get_room(room_code)
-    if not room:
-        raise HTTPException(status_code=404, detail="Room not found")
-
-    token = x_admin_token or admin_token
-    if token != room["admin_token"]:
-        raise HTTPException(status_code=403, detail="Invalid admin token")
-
-    app_id = payload.get("app_id", "static_site")
-    requested_node_id = payload.get("node_id")
-    port = payload.get("port")
-
-    nodes = db.get_room_nodes(room_code)
-    if not nodes:
-        raise HTTPException(status_code=400, detail="No nodes connected to host application")
-
-    # If no node specified, automatically pick the node with the MOST free RAM
-    if requested_node_id:
-        target_node = next((n for n in nodes if n.node_id == requested_node_id), None)
-        if not target_node:
-            raise HTTPException(status_code=404, detail=f"Node '{requested_node_id}' not found in room")
-    else:
-        target_node = max(nodes, key=lambda n: n.ram_free_gb)
-
-    target_ws = agent_sockets.get((room_code, target_node.node_id))
-    if not target_ws:
-        raise HTTPException(status_code=500, detail=f"Target node '{target_node.node_id}' control socket not active")
-
-    # Send run_app command to agent
-    await target_ws.send_text(
-        json.dumps(
-            {
-                "type": "run_app",
-                "app_id": app_id,
-                "port": port,
-            }
-        )
-    )
-
-    logger.info(f"Sent deploy command for '{app_id}' to node [{target_node.node_id}]")
-    return {
-        "status": "deploying",
-        "app_id": app_id,
-        "node_id": target_node.node_id,
-        "selection_reason": "most_free_ram" if not requested_node_id else "explicit_selection",
-    }
-
-
-@app.get("/api/rooms/{room_code}/apps")
-async def list_deployed_apps(room_code: str):
-    """Return all currently active hosted apps for this room."""
-    return {"apps": list(deployed_apps_registry.values())}
-
-
-@app.post("/api/rooms/{room_code}/apps/{app_id}/stop")
-async def stop_deployed_app(
-    room_code: str,
-    app_id: str,
-    x_admin_token: Optional[str] = Header(None, alias="X-Admin-Token"),
-    admin_token: Optional[str] = Query(None),
-):
-    """Stop a hosted edge application."""
-    room = db.get_room(room_code)
-    if not room:
-        raise HTTPException(status_code=404, detail="Room not found")
-
-    token = x_admin_token or admin_token
-    if token != room["admin_token"]:
-        raise HTTPException(status_code=403, detail="Invalid admin token")
-
-    app_info = deployed_apps_registry.get(app_id)
-    if not app_info:
-        raise HTTPException(status_code=404, detail=f"App '{app_id}' not found")
-
-    node_id = app_info["node_id"]
-    target_ws = agent_sockets.get((room_code, node_id))
-    if target_ws:
-        await target_ws.send_text(json.dumps({"type": "stop_app", "app_id": app_id}))
-
-    deployed_apps_registry.pop(app_id, None)
-    await broadcast_to_dashboard(room_code, {"type": "app_stopped", "app_id": app_id})
-    return {"status": "stopped", "app_id": app_id}
-
-
-# ---------------------------------------------------------
-# WebSocket Endpoints
-# ---------------------------------------------------------
-
-@app.websocket("/ws/agent/{room_code}/{node_id}")
-async def agent_control_websocket(websocket: WebSocket, room_code: str, node_id: str):
-    """Control plane connection between worker agent and coordinator."""
-    await websocket.accept()
-    agent_sockets[(room_code, node_id)] = websocket
-    logger.info(f"Agent [{node_id}] connected to control plane for room {room_code}")
-
-    # Check if this node was missing for an active paused job
-    job_id = active_room_jobs.get(room_code)
-    drop_key = (room_code, node_id)
-    if drop_key in node_drop_tasks:
-        drop_task = node_drop_tasks.pop(drop_key)
-        drop_task.cancel()
-        logger.info(f"Node [{node_id}] returned before timeout! Resuming job {job_id}")
-        if job_id and job_id in job_registry:
-            job_registry[job_id]["status"] = "running"
-            db.update_job_status(job_id, "running")
-            # Notify agents to resume
-            for (r_code, n_id), ws in list(agent_sockets.items()):
-                if r_code == room_code:
+    @app.websocket("/ws/relay/{code}/{node_id}")
+    async def relay_ws(ws: WebSocket, code: str, node_id: str, token: str = ""):
+        """Forward binary tensor frames between members of the SAME room only."""
+        node = node_auth(code, node_id, token)
+        if node is None:
+            await ws.close(code=4403, reason="bad room, node or token")
+            return
+        await ws.accept()
+        room = hub.room(code)
+        node.relay = ws
+        await hub.flush_pending(room, node)
+        sender_prefix = UINT32.pack(len(node_id.encode())) + node_id.encode()
+        try:
+            while True:
+                data = await ws.receive_bytes()
+                if len(data) < UINT32.size or len(data) > MAX_RELAY_FRAME:
+                    continue
+                (n,) = UINT32.unpack_from(data, 0)
+                if n > 64:
+                    continue
+                target_id = data[UINT32.size:UINT32.size + n].decode("utf-8", "replace")
+                frame = sender_prefix + data[UINT32.size + n:]
+                target = room.nodes.get(target_id)  # lookup is per room: no cross-room relaying
+                if target is None:
+                    continue
+                if target.relay is not None:
                     try:
-                        await ws.send_text(json.dumps({"type": "resume", "job_id": job_id}))
+                        await target.relay.send_bytes(frame)
+                        continue
                     except Exception:
                         pass
-            await broadcast_to_dashboard(
-                room_code,
-                {"type": "job_resumed", "job_id": job_id, "returned_node": node_id},
-            )
+                hub.queue_pending(room, target_id, frame)  # deliver when it reconnects
+        except (WebSocketDisconnect, RuntimeError):
+            pass
+        finally:
+            if node.relay is ws:
+                node.relay = None
 
-    try:
-        while True:
-            text_data = await websocket.receive_text()
-            msg = json.loads(text_data)
-            mtype = msg.get("type")
+    @app.websocket("/ws/dashboard/{code}")
+    async def dashboard_ws(ws: WebSocket, code: str):
+        """Read-only live feed for browsers. Commands go through REST with the admin token."""
+        if not ROOM_RE.match(code) or not db.get_room(code):
+            await ws.close(code=4404, reason="room not found")
+            return
+        await ws.accept()
+        room = hub.room(code)
+        room.dashboards.add(ws)
+        try:
+            await ws.send_text(json.dumps(hub.snapshot(room)))
+            while True:
+                await ws.receive_text()  # browser pings; content ignored
+        except (WebSocketDisconnect, RuntimeError):
+            pass
+        finally:
+            room.dashboards.discard(ws)
 
-            if mtype == "register" or mtype == "heartbeat":
-                telemetry = NodeTelemetry(**msg["telemetry"])
-                db.upsert_node(room_code, telemetry)
-                await broadcast_to_dashboard(
-                    room_code,
-                    {"type": "node_update", "telemetry": telemetry.model_dump()},
-                )
+    # ---------------------------------------------------- dashboard files
+    @app.get("/{path:path}", include_in_schema=False)
+    async def spa(path: str):
+        index = DIST_DIR / "index.html"
+        if path.startswith(("api/", "ws/")):
+            raise ApiError(404, "Not found")
+        if path:
+            target = (DIST_DIR / path).resolve()
+            # Only serve files that really live inside dashboard/dist (no ../ tricks).
+            if target.is_file() and DIST_DIR.resolve() in target.parents:
+                return FileResponse(target)
+        if index.exists():
+            return FileResponse(index)
+        return PlainTextResponse("Dashboard not built. Run: cd dashboard && npm install && npm run build", status_code=503)
 
-            elif mtype == "app_started":
-                app_info = msg["app_info"]
-                deployed_apps_registry[app_info["app_id"]] = app_info
-                logger.info(f"App '{app_info['app_id']}' started on [{node_id}]: {app_info['url']}")
-                await broadcast_to_dashboard(
-                    room_code,
-                    {"type": "app_deployed", "app_info": app_info},
-                )
-
-            elif mtype == "app_stopped":
-                app_id = msg["app_id"]
-                deployed_apps_registry.pop(app_id, None)
-                await broadcast_to_dashboard(
-                    room_code,
-                    {"type": "app_stopped", "app_id": app_id},
-                )
-
-    except (WebSocketDisconnect, asyncio.CancelledError):
-        pass
-    finally:
-        agent_sockets.pop((room_code, node_id), None)
-        db.remove_node(node_id)
-        logger.info(f"Agent [{node_id}] disconnected from control plane")
-        await broadcast_to_dashboard(
-            room_code,
-            {"type": "node_left", "node_id": node_id},
-        )
-
-        # Robust Node-Drop Handling: If an active job is running, pause it and wait with a grace timer
-        current_job_id = active_room_jobs.get(room_code)
-        if current_job_id and current_job_id in job_registry:
-            job_info = job_registry[current_job_id]
-            if node_id in job_info.get("nodes", []):
-                logger.warning(
-                    f"Participating node [{node_id}] dropped during active job {current_job_id}! Pausing job..."
-                )
-                job_info["status"] = "paused"
-                db.update_job_status(current_job_id, "paused")
-
-                # Instruct remaining agents to pause
-                for (r_code, n_id), ws in list(agent_sockets.items()):
-                    if r_code == room_code:
-                        try:
-                            await ws.send_text(
-                                json.dumps(
-                                    {
-                                        "type": "pause",
-                                        "job_id": current_job_id,
-                                        "reason": f"Node {node_id} dropped",
-                                    }
-                                )
-                            )
-                        except Exception:
-                            pass
-
-                await broadcast_to_dashboard(
-                    room_code,
-                    {
-                        "type": "job_paused",
-                        "job_id": current_job_id,
-                        "dropped_node": node_id,
-                        "grace_seconds": 10.0,
-                    },
-                )
-
-                async def _grace_timeout_handler():
-                    try:
-                        await asyncio.sleep(10.0)
-                        if drop_key in node_drop_tasks:
-                            logger.error(f"Node [{node_id}] failed to return within 10s grace period. Failing job {current_job_id}")
-                            job_info["status"] = "failed"
-                            db.update_job_status(current_job_id, "failed")
-                            active_room_jobs.pop(room_code, None)
-                            node_drop_tasks.pop(drop_key, None)
-                            await broadcast_to_dashboard(
-                                room_code,
-                                {
-                                    "type": "job_failed",
-                                    "job_id": current_job_id,
-                                    "reason": f"Node {node_id} disconnected and timed out",
-                                },
-                            )
-                    except asyncio.CancelledError:
-                        pass
-
-                drop_task = asyncio.create_task(_grace_timeout_handler())
-                node_drop_tasks[drop_key] = drop_task
+    return app
 
 
-@app.websocket("/ws/relay/{room_code}/{node_id}")
-async def binary_relay_websocket(websocket: WebSocket, room_code: str, node_id: str):
-    """Data plane: routes binary tensor frames between pool nodes."""
-    await websocket.accept()
-    relay_sockets[(room_code, node_id)] = websocket
-    logger.info(f"RelayTransport [{node_id}] connected in room {room_code}")
-
-    try:
-        while True:
-            message = await websocket.receive_bytes()
-            if len(message) < UINT32_STRUCT.size:
-                continue
-
-            # Envelope from sender: [4-byte target_len][target_id][payload]
-            (target_len,) = UINT32_STRUCT.unpack_from(message, 0)
-            target_id = message[UINT32_STRUCT.size : UINT32_STRUCT.size + target_len].decode("utf-8")
-            raw_payload = message[UINT32_STRUCT.size + target_len :]
-
-            target_ws = relay_sockets.get((room_code, target_id))
-            if target_ws:
-                # Forward envelope to recipient: [4-byte sender_len][sender_id][payload]
-                sender_bytes = node_id.encode("utf-8")
-                forward_frame = (
-                    UINT32_STRUCT.pack(len(sender_bytes)) + sender_bytes + raw_payload
-                )
-                await target_ws.send_bytes(forward_frame)
-            else:
-                logger.warning(f"Relay dropped frame: target node [{target_id}] not connected")
-
-    except (WebSocketDisconnect, asyncio.CancelledError):
-        pass
-    finally:
-        relay_sockets.pop((room_code, node_id), None)
-        logger.info(f"RelayTransport [{node_id}] disconnected")
+app = create_app() if os.environ.get("POOLFORGE_NO_DEFAULT_APP") != "1" else None
 
 
-@app.websocket("/ws/dashboard/{room_code}")
-async def dashboard_websocket(websocket: WebSocket, room_code: str):
-    """Live streaming WebSocket for the React web dashboard."""
-    await websocket.accept()
-    if room_code not in dashboard_sockets:
-        dashboard_sockets[room_code] = set()
-    dashboard_sockets[room_code].add(websocket)
+class RedactTokens(logging.Filter):
+    """Hide ?token=... in log lines (uvicorn logs every WebSocket URL)."""
 
-    # Immediately send current state snapshot
-    room = db.get_room(room_code)
-    nodes = db.get_room_nodes(room_code)
-    await websocket.send_text(
-        json.dumps(
-            {
-                "type": "snapshot",
-                "room": room,
-                "nodes": [n.model_dump() for n in nodes],
-                "active_job": active_room_jobs.get(room_code),
-            }
-        )
-    )
-
-    try:
-        while True:
-            # Keep-alive ping/pong
-            await websocket.receive_text()
-    except (WebSocketDisconnect, asyncio.CancelledError):
-        pass
-    finally:
-        dashboard_sockets[room_code].discard(websocket)
+    def filter(self, record: logging.LogRecord) -> bool:
+        msg = record.getMessage()
+        if "token=" in msg:
+            record.msg, record.args = re.sub(r"token=[^\s&\"]+", "token=***", msg), ()
+        return True
 
 
-# ---------------------------------------------------------
-# Static File Hosting (Serves built React dashboard)
-# ---------------------------------------------------------
-dist_dir = Path(__file__).resolve().parent.parent / "dashboard" / "dist"
-if dist_dir.exists():
-    assets_dir = dist_dir / "assets"
-    assets_dir.mkdir(parents=True, exist_ok=True)
-    app.mount("/assets", StaticFiles(directory=assets_dir), name="assets")
+def main() -> None:
+    import uvicorn
 
-    @app.get("/{full_path:path}")
-    async def serve_spa(full_path: str):
-        file_path = dist_dir / full_path
-        if file_path.exists() and file_path.is_file():
-            return FileResponse(file_path)
-        return FileResponse(dist_dir / "index.html")
+    logging.basicConfig(level=os.environ.get("LOG_LEVEL", "INFO"), format="%(asctime)s %(levelname)s %(name)s: %(message)s")
+    port = int(os.environ.get("PORT") or os.environ.get("POOLFORGE_PORT", 8000))
+    host = os.environ.get("POOLFORGE_HOST", "0.0.0.0")
+    config = uvicorn.Config(app, host=host, port=port, ws="websockets-sansio", ws_max_size=MAX_RELAY_FRAME,
+                            log_level="info", access_log=False)
+    for name in ("uvicorn", "uvicorn.error", "uvicorn.access"):
+        logging.getLogger(name).addFilter(RedactTokens())
+    print(f"PoolForge coordinator on http://{host}:{port}  (dashboard: http://localhost:{port})")
+    uvicorn.Server(config).run()
 
 
 if __name__ == "__main__":
-    import uvicorn
-    uvicorn.run("coordinator.server:app", host="0.0.0.0", port=8000, reload=False)
+    main()
