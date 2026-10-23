@@ -114,15 +114,21 @@ def serialize_tensor(
     return HEADER_LEN_STRUCT.pack(header_len) + header_bytes + raw_bytes
 
 
-def deserialize_tensor(data: bytes) -> Tuple[torch.Tensor, Dict[str, Any]]:
+def deserialize_tensor(
+    data: bytes,
+    decrypt_key: Optional[bytes] = None,
+) -> Tuple[torch.Tensor, Dict[str, Any]]:
     """Deserialize binary wire format into a PyTorch tensor and its metadata header.
 
     Args:
         data: Framed bytes received from the network.
+        decrypt_key: Optional 32-byte AES-256 key.  Must be provided (and match the
+            sender's key) when the header carries ``"encrypted": true``.  If ``None``
+            and the packet is flagged as encrypted a ``ValueError`` is raised.
 
     Returns:
         (tensor, header_dict) where tensor has the original shape, dtype, and contents,
-        and is detached with its own memory copy (ready for autograd).
+        and is detached with its own memory copy (ready for autograd)."""
     """
     if len(data) < HEADER_LEN_STRUCT.size:
         raise ValueError(f"Packet too short to contain header length: {len(data)} bytes")
@@ -153,6 +159,16 @@ def deserialize_tensor(data: bytes) -> Tuple[torch.Tensor, Dict[str, Any]]:
         raise ValueError(
             f"Corrupt tensor payload: expected {num_bytes} bytes from header, got {len(raw_bytes)}"
         )
+
+    # Decrypt payload if the sender flagged it as encrypted
+    if header.get("encrypted", False):
+        if decrypt_key is None:
+            raise ValueError(
+                "Received encrypted tensor payload but no decrypt_key was provided. "
+                "Pass the room key via decrypt_key= parameter."
+            )
+        from common.crypto import decrypt_payload
+        raw_bytes = decrypt_payload(raw_bytes, decrypt_key)
 
     # Make buffer writable to ensure autograd safety and suppress PyTorch non-writable buffer warnings
     writable_bytes = bytearray(raw_bytes)
