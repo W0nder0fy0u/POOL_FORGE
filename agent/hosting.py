@@ -80,6 +80,13 @@ class AppManager:
         self.apps: Dict[str, RunningApp] = {}
         self.has_docker = docker_available()
         self.has_cloudflared = cloudflared_available()
+        # One lock per deployment: start/stop requests for the same app run one
+        # after another, in arrival order (asyncio locks are FIFO). Without this a
+        # "restart" (stop + run) could stop the freshly started app.
+        self._locks: Dict[str, asyncio.Lock] = {}
+
+    def _lock(self, dep_id: str) -> asyncio.Lock:
+        return self._locks.setdefault(dep_id, asyncio.Lock())
 
     async def _state(self, dep_id: str, status: str, url: Optional[str] = None, detail: str = "") -> None:
         await self.report(AppStateMsg(type="app_state", deployment_id=dep_id, status=status, url=url, detail=detail[:1900]))
@@ -101,8 +108,12 @@ class AppManager:
         raise RuntimeError(f"Unknown sample {cfg['sample']}")
 
     async def start(self, dep_id: str, app_id: str) -> None:
+        async with self._lock(dep_id):
+            await self._start(dep_id, app_id)
+
+    async def _start(self, dep_id: str, app_id: str) -> None:
         if dep_id in self.apps:
-            await self.stop(dep_id, report=False)
+            await self._stop(dep_id, report=False)
         try:
             cfg = get_app(app_id)
         except PermissionError as exc:
@@ -127,7 +138,7 @@ class AppManager:
             await self._wait_for_port(port, proc, timeout=120 if cfg["kind"] == "docker" else 20)
             app.url, detail = await self._expose(app)
         except Exception as exc:
-            await self.stop(dep_id, report=False)
+            await self._stop(dep_id, report=False)
             await self._state(dep_id, "error", detail=str(exc))
             return
         app.watcher = asyncio.create_task(self._watch(app))
@@ -203,6 +214,10 @@ class AppManager:
                     p.kill()
 
     async def stop(self, dep_id: str, report: bool = True) -> None:
+        async with self._lock(dep_id):
+            await self._stop(dep_id, report)
+
+    async def _stop(self, dep_id: str, report: bool = True) -> None:
         app = self.apps.pop(dep_id, None)
         if app:
             if app.watcher:
@@ -214,3 +229,4 @@ class AppManager:
     async def stop_all(self) -> None:
         for dep_id in list(self.apps):
             await self.stop(dep_id, report=False)
+        self._locks.clear()
