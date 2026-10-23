@@ -62,6 +62,8 @@ active_room_jobs: Dict[str, str] = {}
 job_registry: Dict[str, Dict[str, Any]] = {}
 # Drop grace timers: (room_code, node_id) -> asyncio.Task
 node_drop_tasks: Dict[tuple[str, str], asyncio.Task] = {}
+# Deployed edge apps registry: app_id -> metadata dict
+deployed_apps_registry: Dict[str, Dict[str, Any]] = {}
 
 # Simple in-memory rate limiter: ip -> list of timestamps
 rate_limit_history: Dict[str, list[float]] = {}
@@ -368,6 +370,102 @@ async def get_metrics(room_code: str, job_id: Optional[str] = None):
 
 
 # ---------------------------------------------------------
+# Hosting APIs (Edge Microservice Deployment)
+# ---------------------------------------------------------
+
+@app.post("/api/rooms/{room_code}/deploy")
+async def deploy_app(
+    room_code: str,
+    payload: Dict[str, Any],
+    x_admin_token: Optional[str] = Header(None, alias="X-Admin-Token"),
+    admin_token: Optional[str] = Query(None),
+):
+    """Deploy an allow-listed edge web application onto a pool node."""
+    room = db.get_room(room_code)
+    if not room:
+        raise HTTPException(status_code=404, detail="Room not found")
+
+    token = x_admin_token or admin_token
+    if token != room["admin_token"]:
+        raise HTTPException(status_code=403, detail="Invalid admin token")
+
+    app_id = payload.get("app_id", "static_site")
+    requested_node_id = payload.get("node_id")
+    port = payload.get("port")
+
+    nodes = db.get_room_nodes(room_code)
+    if not nodes:
+        raise HTTPException(status_code=400, detail="No nodes connected to host application")
+
+    # If no node specified, automatically pick the node with the MOST free RAM
+    if requested_node_id:
+        target_node = next((n for n in nodes if n.node_id == requested_node_id), None)
+        if not target_node:
+            raise HTTPException(status_code=404, detail=f"Node '{requested_node_id}' not found in room")
+    else:
+        target_node = max(nodes, key=lambda n: n.ram_free_gb)
+
+    target_ws = agent_sockets.get((room_code, target_node.node_id))
+    if not target_ws:
+        raise HTTPException(status_code=500, detail=f"Target node '{target_node.node_id}' control socket not active")
+
+    # Send run_app command to agent
+    await target_ws.send_text(
+        json.dumps(
+            {
+                "type": "run_app",
+                "app_id": app_id,
+                "port": port,
+            }
+        )
+    )
+
+    logger.info(f"Sent deploy command for '{app_id}' to node [{target_node.node_id}]")
+    return {
+        "status": "deploying",
+        "app_id": app_id,
+        "node_id": target_node.node_id,
+        "selection_reason": "most_free_ram" if not requested_node_id else "explicit_selection",
+    }
+
+
+@app.get("/api/rooms/{room_code}/apps")
+async def list_deployed_apps(room_code: str):
+    """Return all currently active hosted apps for this room."""
+    return {"apps": list(deployed_apps_registry.values())}
+
+
+@app.post("/api/rooms/{room_code}/apps/{app_id}/stop")
+async def stop_deployed_app(
+    room_code: str,
+    app_id: str,
+    x_admin_token: Optional[str] = Header(None, alias="X-Admin-Token"),
+    admin_token: Optional[str] = Query(None),
+):
+    """Stop a hosted edge application."""
+    room = db.get_room(room_code)
+    if not room:
+        raise HTTPException(status_code=404, detail="Room not found")
+
+    token = x_admin_token or admin_token
+    if token != room["admin_token"]:
+        raise HTTPException(status_code=403, detail="Invalid admin token")
+
+    app_info = deployed_apps_registry.get(app_id)
+    if not app_info:
+        raise HTTPException(status_code=404, detail=f"App '{app_id}' not found")
+
+    node_id = app_info["node_id"]
+    target_ws = agent_sockets.get((room_code, node_id))
+    if target_ws:
+        await target_ws.send_text(json.dumps({"type": "stop_app", "app_id": app_id}))
+
+    deployed_apps_registry.pop(app_id, None)
+    await broadcast_to_dashboard(room_code, {"type": "app_stopped", "app_id": app_id})
+    return {"status": "stopped", "app_id": app_id}
+
+
+# ---------------------------------------------------------
 # WebSocket Endpoints
 # ---------------------------------------------------------
 
@@ -412,6 +510,23 @@ async def agent_control_websocket(websocket: WebSocket, room_code: str, node_id:
                 await broadcast_to_dashboard(
                     room_code,
                     {"type": "node_update", "telemetry": telemetry.model_dump()},
+                )
+
+            elif mtype == "app_started":
+                app_info = msg["app_info"]
+                deployed_apps_registry[app_info["app_id"]] = app_info
+                logger.info(f"App '{app_info['app_id']}' started on [{node_id}]: {app_info['url']}")
+                await broadcast_to_dashboard(
+                    room_code,
+                    {"type": "app_deployed", "app_info": app_info},
+                )
+
+            elif mtype == "app_stopped":
+                app_id = msg["app_id"]
+                deployed_apps_registry.pop(app_id, None)
+                await broadcast_to_dashboard(
+                    room_code,
+                    {"type": "app_stopped", "app_id": app_id},
                 )
 
     except (WebSocketDisconnect, asyncio.CancelledError):

@@ -21,6 +21,7 @@ from common.datasets import get_dataloader
 from common.pipeline import PipelineStage
 from common.schemas import AssignJobMessage, NodeTelemetry, StepMetric
 from common.transports import DirectTCPTransport, RelayTransport, Transport
+from agent.hosting import AppRunner
 
 logger = logging.getLogger("poolforge.agent")
 
@@ -54,6 +55,7 @@ class AgentWorker:
         self._direct_tcp: Optional[DirectTCPTransport] = None
         self._pause_event = asyncio.Event()
         self._pause_event.set()
+        self.app_runner = AppRunner(self.node_id)
 
     def get_telemetry(self) -> NodeTelemetry:
         """Poll host memory, CPU, and platform details."""
@@ -161,6 +163,18 @@ class AgentWorker:
                         logger.info("Received resume signal from coordinator")
                         self._pause_event.set()
                         self.status = "training"
+
+                    elif mtype == "run_app":
+                        app_id = msg.get("app_id")
+                        port = msg.get("port")
+                        logger.info(f"Received deploy app command: {app_id}")
+                        app_res = await self.app_runner.start_app(app_id, port)
+                        await ws.send(json.dumps({"type": "app_started", "app_info": app_res}))
+
+                    elif mtype == "stop_app":
+                        app_id = msg.get("app_id")
+                        await self.app_runner.stop_app(app_id)
+                        await ws.send(json.dumps({"type": "app_stopped", "app_id": app_id}))
 
             finally:
                 heartbeat_task.cancel()
