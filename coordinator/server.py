@@ -378,7 +378,9 @@ async def dashboard_websocket(websocket: WebSocket, room_code: str):
 # ---------------------------------------------------------
 dist_dir = Path(__file__).resolve().parent.parent / "dashboard" / "dist"
 if dist_dir.exists():
-    app.mount("/assets", StaticFiles(directory=dist_dir / "assets"), name="assets")
+    assets_dir = dist_dir / "assets"
+    assets_dir.mkdir(parents=True, exist_ok=True)
+    app.mount("/assets", StaticFiles(directory=assets_dir), name="assets")
 
     @app.get("/{full_path:path}")
     async def serve_spa(full_path: str):
