@@ -112,6 +112,7 @@ class DirectTCPTransport(Transport):
         self._inbox: asyncio.Queue[Tuple[str, bytes]] = asyncio.Queue()
         self._peer_addresses: Dict[str, Tuple[str, int]] = {}
         self._peer_connections: Dict[str, Tuple[asyncio.StreamReader, asyncio.StreamWriter]] = {}
+        self._incoming_writers: set[asyncio.StreamWriter] = set()
 
     def register_peer(self, node_id: str, host: str, port: int) -> None:
         """Register the network location of a peer node."""
@@ -135,6 +136,7 @@ class DirectTCPTransport(Transport):
         self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter
     ) -> None:
         """Handle incoming TCP connections from peer nodes."""
+        self._incoming_writers.add(writer)
         try:
             while self._running:
                 # Frame layout: [4-byte total length][4-byte sender_id len][sender_id][payload]
@@ -156,9 +158,10 @@ class DirectTCPTransport(Transport):
         except (asyncio.IncompleteReadError, ConnectionResetError, BrokenPipeError):
             pass
         finally:
+            self._incoming_writers.discard(writer)
             writer.close()
             try:
-                await writer.wait_closed()
+                await asyncio.wait_for(writer.wait_closed(), timeout=0.2)
             except Exception:
                 pass
 
@@ -212,12 +215,22 @@ class DirectTCPTransport(Transport):
         self._running = False
         if self._server:
             self._server.close()
-            await self._server.wait_closed()
+            try:
+                await asyncio.wait_for(self._server.wait_closed(), timeout=0.5)
+            except Exception:
+                pass
+
+        for writer in list(self._incoming_writers):
+            try:
+                writer.close()
+            except Exception:
+                pass
+        self._incoming_writers.clear()
 
         for target_id, (_, writer) in list(self._peer_connections.items()):
             try:
                 writer.close()
-                await writer.wait_closed()
+                await asyncio.wait_for(writer.wait_closed(), timeout=0.5)
             except Exception:
                 pass
         self._peer_connections.clear()
