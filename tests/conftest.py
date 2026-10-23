@@ -59,7 +59,7 @@ class Coordinator:
 
 @pytest.fixture
 async def coordinator(tmp_path):
-    app = create_app(str(tmp_path / "test.db"), drop_grace_s=8)
+    app = create_app(str(tmp_path / "test.db"), drop_grace_s=6)
     port = free_port()
     server = uvicorn.Server(uvicorn.Config(app, host="127.0.0.1", port=port, log_level="warning", ws_max_size=600 * 1024 * 1024, ws="websockets-sansio"))
     task = asyncio.create_task(server.serve())
