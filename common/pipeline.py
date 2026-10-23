@@ -137,6 +137,8 @@ class PipelineStage:
         """
         run = asyncio.to_thread
         self.layers.train()
+        # When this step's first input became available (used for honest step timing).
+        self.first_input_time = time.perf_counter()
         if self.optimizer:
             self.optimizer.zero_grad()
 
@@ -155,6 +157,8 @@ class PipelineStage:
                 out = await run(self.layers, xs[m])
             else:
                 inp = (await self.mailbox.get("activation", step, m)).requires_grad_()
+                if m == 0:
+                    self.first_input_time = time.perf_counter()
                 labels = await self.mailbox.get("labels", step, m)
                 out = await run(self.layers, inp)
 

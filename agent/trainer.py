@@ -73,14 +73,21 @@ async def run_job(
         transport.take_step_stats()  # reset counters
 
         total = hp.epochs * hp.steps_per_epoch
+        prev_end = None  # end time of the previous step
         for step in range(start, total):
-            await gate.wait()  # blocks here while paused
-            t0 = time.perf_counter()
+            if not gate.is_set():
+                await gate.wait()  # blocks here while paused
+                prev_end = None  # don't count the pause as step time
             x = y = None
             if stage.is_first:
                 x, y = next(batches)
             loss = await stage.train_step(step, x, y, hp.microbatches)
-            step_ms = (time.perf_counter() - t0) * 1000.0
+            now = time.perf_counter()
+            # Step time = time between finishing consecutive steps (the pipeline's real
+            # pace). For the first step we start the clock when its input arrived, so
+            # one-off setup such as the first stage downloading MNIST is not counted.
+            step_ms = (now - (prev_end if prev_end is not None else stage.first_input_time)) * 1000.0
+            prev_end = now
             net = transport.take_step_stats()
             await report(StepMsg(
                 type="step", job_id=assign.job_id, stage=i, step=step + 1, epoch=step // hp.steps_per_epoch + 1,
