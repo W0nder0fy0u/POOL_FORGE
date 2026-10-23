@@ -3,31 +3,53 @@
 Only the **coordinator** is hosted. Agents run on each person's laptop and connect
 out to it.
 
-## Option 1: Docker (any server or your own PC)
+## Option 1: Docker on your own PC or server
 
 ```bash
-docker build -f deploy/Dockerfile -t poolforge-coordinator .
-docker run -d -p 8000:8000 -v poolforge-data:/app/data --name poolforge poolforge-coordinator
+docker compose up --build        # builds deploy/Dockerfile, runs on http://localhost:8000
+docker compose down              # stop (rooms/history kept in the poolforge-data volume)
 ```
 
-Open `http://<server>:8000`. The image is ~165 MB (no PyTorch: the coordinator never
-trains). Podman works too (`podman build ...` / `podman run ...`); with rootless podman
-use `http://127.0.0.1:8000` instead of `localhost`.
+Without compose: `docker build -f deploy/Dockerfile -t poolforge-coordinator .` then
+`docker run -d -p 8000:8000 -v poolforge-data:/app/data poolforge-coordinator`.
+The image is ~165 MB (no PyTorch: the coordinator never trains). Podman works the same
+(`podman build` / `podman run`); with rootless podman use `http://127.0.0.1:8000`.
 
-Optional environment variables (`-e NAME=value`): `POOLFORGE_PUBLIC_URL` (the URL
-printed in join commands), `POOLFORGE_REPO_URL` (git URL shown on the Join page),
-`POOLFORGE_DROP_GRACE_S`. See `.env.example`.
+Optional environment variables: `POOLFORGE_PUBLIC_URL` (URL printed in join commands),
+`POOLFORGE_REPO_URL` (git URL shown on the Join page), `POOLFORGE_DROP_GRACE_S`.
+See `.env.example`.
 
 ## Option 2: Render (free, public HTTPS URL)
 
-1. Push the repo to GitHub.
-2. Render dashboard -> **New -> Blueprint** -> pick the repo (uses `deploy/render.yaml`).
-   Or **New -> Web Service -> Docker**, with Dockerfile path `deploy/Dockerfile`.
-3. Wait for the build, then open `https://<name>.onrender.com`.
+Pick ONE of these two ways.
 
-Free plan notes: the service sleeps after ~15 minutes idle (the first visit wakes it in
-~30 s), and there is no persistent disk, so rooms reset on redeploy. That's fine for a
-demo; for a long-running pool, add a disk (commented in `render.yaml`).
+### 2a. Render builds the image from GitHub (auto-redeploys on every push)
+
+1. Push the repo to GitHub.
+2. Render dashboard -> **New -> Blueprint** -> pick the repo (it reads `deploy/render.yaml`
+   and builds `deploy/Dockerfile`). When asked, set `POOLFORGE_REPO_URL` to your GitHub URL.
+3. Wait for the build, then open `https://<name>.onrender.com/health` -> `{"status":"ok"}`.
+
+### 2b. You build the image, Render just runs it (no GitHub needed on Render)
+
+1. Create a free account on [hub.docker.com](https://hub.docker.com).
+2. Build, self-test and push in one command (asks for your Docker Hub login once):
+   ```bash
+   bash scripts/docker_publish.sh <dockerhub-username>
+   ```
+   -> `docker.io/<dockerhub-username>/poolforge:latest`
+3. Render dashboard -> **New -> Web Service -> Existing Image** -> paste that image URL.
+   - Instance type: **Free**
+   - Health check path: `/health` (Settings -> Health Checks)
+   - Environment: optional `POOLFORGE_REPO_URL` = your GitHub URL
+   Render sets `PORT` itself; the coordinator listens on it automatically.
+4. To update later: run the publish script again, then on Render click
+   **Manual Deploy -> Deploy latest reference**.
+
+### Free plan notes
+The service sleeps after ~15 minutes idle (the first visit wakes it in ~30 s), and
+there is no persistent disk, so rooms reset on redeploy or restart. That's fine for a
+demo; create the pool on the day you test.
 
 ## Option 3: Railway
 

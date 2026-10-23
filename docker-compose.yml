@@ -1,0 +1,24 @@
+# Run the PoolForge coordinator (+ dashboard) in Docker with one command:
+#
+#   docker compose up --build        # then open http://localhost:8000
+#   docker compose down              # stop (data is kept in the poolforge-data volume)
+#
+# Agents are NOT in Docker: each laptop runs `poolforge join CODE --server URL`.
+services:
+  coordinator:
+    build:
+      context: .
+      dockerfile: deploy/Dockerfile
+    image: poolforge-coordinator:latest
+    ports:
+      - "8000:8000"
+    environment:
+      POOLFORGE_DROP_GRACE_S: "30"
+      # POOLFORGE_PUBLIC_URL: "https://your-domain"      # URL shown in join commands
+      # POOLFORGE_REPO_URL: "https://github.com/you/poolforge"
+    volumes:
+      - poolforge-data:/app/data
+    restart: unless-stopped
+
+volumes:
+  poolforge-data:
