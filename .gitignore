@@ -40,6 +40,9 @@ htmlcov/
 # PoolForge dynamic runtime directories
 checkpoints/
 data/
+*.db
+*.db-wal
+*.db-shm
 benchmarks/results/*.csv
 benchmarks/results/*.png
 !benchmarks/results/.gitkeep
