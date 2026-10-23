@@ -38,6 +38,12 @@ def build_parser() -> argparse.ArgumentParser:
     j.add_argument("-v", "--verbose", action="store_true")
 
     sub.add_parser("version", help="print the version")
+
+    # Used internally by the Deploy tab when running as a PyInstaller .exe.
+    st = sub.add_parser("serve-static")
+    st.add_argument("--port", type=int, required=True)
+    st.add_argument("--bind", default="127.0.0.1")
+    st.add_argument("--dir", required=True)
     return p
 
 
@@ -45,6 +51,13 @@ def main(argv=None) -> int:
     args = build_parser().parse_args(argv)
     if args.command == "version":
         print(f"PoolForge agent {__version__}")
+        return 0
+    if args.command == "serve-static":
+        import functools
+        from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
+
+        handler = functools.partial(SimpleHTTPRequestHandler, directory=args.dir)
+        ThreadingHTTPServer((args.bind, args.port), handler).serve_forever()
         return 0
     if args.command != "join":
         build_parser().print_help()

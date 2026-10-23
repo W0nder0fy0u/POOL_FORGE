@@ -99,10 +99,13 @@ class AppManager:
             return ["docker", "run", "--rm", "--name", f"poolforge-{dep_id}", "--memory", "256m",
                     "-p", f"{bind}:{port}:{cfg['container_port']}", cfg["image"]]
         app_dir = SAMPLES_DIR / cfg["sample"]
+        frozen = getattr(sys, "frozen", False)  # running as poolforge-agent.exe (PyInstaller)
         if cfg["sample"] == "static_site":
+            if frozen:  # the .exe has no `python -m`, so it serves files itself
+                return [sys.executable, "serve-static", "--port", str(port), "--bind", bind, "--dir", str(app_dir)]
             return [sys.executable, "-m", "http.server", str(port), "--bind", bind, "--directory", str(app_dir)]
         if cfg["sample"] == "flask_app":
-            if importlib.util.find_spec("flask") is None:
+            if frozen or importlib.util.find_spec("flask") is None:
                 raise RuntimeError("Flask is not installed on this node. Run: pip install flask")
             return [sys.executable, str(app_dir / "app.py"), "--port", str(port), "--host", bind]
         raise RuntimeError(f"Unknown sample {cfg['sample']}")

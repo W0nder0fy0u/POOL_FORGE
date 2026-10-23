@@ -9,7 +9,7 @@ One training step with M micro-batches works like this (GPipe schedule):
     last stage  : inp = recv().requires_grad_(); loss = CE(layers(inp), labels)
 
   BACKWARD, for each micro-batch m:
-    last stage  : loss.backward()             -> send inp.grad to previous
+    last stage  : loss.backward() right after its forward -> send inp.grad back
     middle stage: g = recv(); out.backward(g) -> send inp.grad to previous
     first stage : g = recv(); out.backward(g)
 
@@ -35,10 +35,14 @@ import torch
 import torch.nn as nn
 
 from common.models import build_layers, make_optimizer
-from common.protocol import deserialize_tensor, serialize_tensor
+from common.protocol import deserialize_tensor, read_header, serialize_tensor
 from common.transports import LocalHub, LocalTransport, Transport
 
 logger = logging.getLogger("poolforge.pipeline")
+
+
+class EncryptionMismatch(RuntimeError):
+    """Nodes in one job disagree about --encrypt-passphrase."""
 
 
 class Mailbox:
@@ -58,14 +62,26 @@ class Mailbox:
     async def get(self, kind: str, step: int, mb: int) -> torch.Tensor:
         key = (kind, step, mb)
         while key not in self._stash:
-            _sender, frame = await self.transport.recv()
+            sender, frame = await self.transport.recv()
             try:
-                tensor, hdr = deserialize_tensor(frame, self.decrypt_key)
-            except Exception as exc:  # corrupt / wrong key: log and ignore the frame
-                logger.warning("Dropping bad frame: %s", exc)
+                hdr, _ = read_header(frame)
+            except ValueError as exc:  # garbage: log and ignore the frame
+                logger.warning("Dropping bad frame from %s: %s", sender, exc)
                 continue
             if hdr["job_id"] != self.job_id:
-                continue  # leftover from an older job
+                continue  # leftover from an older job / attempt
+            # Encryption must match on both sides; otherwise fail loudly instead of hanging.
+            if bool(self.decrypt_key) != bool(hdr["encrypted"]):
+                raise EncryptionMismatch(
+                    f"node {sender} sent {'encrypted' if hdr['encrypted'] else 'unencrypted'} tensors but this node "
+                    f"{'uses' if self.decrypt_key else 'does not use'} --encrypt-passphrase; all nodes must match"
+                )
+            try:
+                tensor, hdr = deserialize_tensor(frame, self.decrypt_key)
+            except Exception as exc:
+                if hdr["encrypted"]:
+                    raise EncryptionMismatch(f"cannot decrypt tensors from node {sender}: different --encrypt-passphrase?") from exc
+                raise
             self._stash[(hdr["kind"], hdr["step"], hdr["microbatch"])] = tensor
         return self._stash.pop(key)
 
@@ -147,7 +163,7 @@ class PipelineStage:
         if self.is_first and len(xs) != microbatches:
             raise ValueError("batch_size must be >= microbatches")
 
-        saved: List[Tuple[Optional[torch.Tensor], torch.Tensor]] = []  # (input, output-or-loss)
+        saved: List[Tuple[Optional[torch.Tensor], torch.Tensor]] = []  # (input, output) of non-last stages
         total_loss = 0.0
 
         # ---------------- forward pass for every micro-batch ----------------
@@ -166,21 +182,23 @@ class PipelineStage:
                 # Divide by M so the summed gradients equal those of the full batch.
                 loss = self.loss_fn(out, labels) / microbatches
                 total_loss += loss.item()
-                saved.append((inp, loss))
+                # The last stage runs backward right away for each micro-batch, so its
+                # gradient can travel back while the next micro-batch is computed.
+                # (Same maths: gradients just accumulate in .grad.)
+                await run(loss.backward)
+                if not self.is_first:
+                    await self._send(self.prev_node, inp.grad, "gradient", step, m)
             else:
                 await self._send(self.next_node, out.detach(), "activation", step, m)
                 await self._send(self.next_node, labels, "labels", step, m)
                 saved.append((inp, out))
 
-        # ---------------- backward pass for every micro-batch ---------------
-        for m in range(microbatches):
+        # ------- backward pass for every micro-batch (non-last stages) -------
+        for m in range(len(saved)):
             inp, out = saved[m]
-            if self.is_last:
-                await run(out.backward)  # `out` is the loss here
-            else:
-                grad = await self.mailbox.get("gradient", step, m)
-                if out.requires_grad:  # False only for a first stage with no weights
-                    await run(out.backward, grad)
+            grad = await self.mailbox.get("gradient", step, m)
+            if out.requires_grad:  # False only for a first stage with no weights
+                await run(out.backward, grad)
             if not self.is_first:
                 await self._send(self.prev_node, inp.grad, "gradient", step, m)
 

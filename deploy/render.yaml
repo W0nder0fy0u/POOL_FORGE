@@ -1,35 +1,22 @@
-# PoolForge Coordinator — Render.com deployment configuration
-# https://render.com/docs/render-yaml-spec
-#
-# Deploy with: connect your GitHub repo to Render and it will pick this file up.
-# Free tier works for demo/viva purposes; upgrade for production use.
-
+# Render.com blueprint for the PoolForge coordinator.
+# Render -> New -> Blueprint -> pick this repo. (Or New -> Web Service -> Docker,
+# Dockerfile path: deploy/Dockerfile.) WebSockets work out of the box on Render.
 services:
   - type: web
-    name: poolforge-coordinator
-    env: python
-    region: oregon  # change to 'frankfurt' for EU proximity
-    plan: free      # upgrade to 'starter' for always-on service
-
-    # Render sets the working directory to the repo root automatically
-    buildCommand: pip install fastapi "uvicorn[standard]" websockets pydantic aiofiles psutil cryptography
-    startCommand: uvicorn coordinator.server:app --host 0.0.0.0 --port $PORT
-
-    # Health check endpoint — Render will restart the service if it returns non-2xx
+    name: poolforge
+    runtime: docker
+    dockerfilePath: ./deploy/Dockerfile
+    dockerContext: .
+    plan: free            # free tier sleeps after ~15 min idle; first request wakes it (~30 s)
     healthCheckPath: /health
-
     envVars:
-      # Render generates a random SECRET_KEY on each deploy; agents re-register on restart
-      - key: SECRET_KEY
-        generateValue: true
-      # Python logging level (set to WARNING in production to reduce noise)
+      - key: POOLFORGE_DROP_GRACE_S
+        value: "30"
       - key: LOG_LEVEL
         value: INFO
-
-    # Persistent disk for SQLite — required so the database survives deploys
-    # Note: Free tier does NOT support persistent disks; use the 'starter' plan or
-    # switch to a hosted Postgres by setting DATABASE_URL to a postgres:// URI.
-    disk:
-      name: poolforge-data
-      mountPath: /app/data
-      sizeGB: 1
+    # The free plan has no persistent disk: rooms/run history reset on every deploy or restart.
+    # On a paid plan, uncomment to keep the SQLite database:
+    # disk:
+    #   name: poolforge-data
+    #   mountPath: /app/data
+    #   sizeGB: 1

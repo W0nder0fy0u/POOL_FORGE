@@ -1,63 +1,42 @@
-# PoolForge Coordinator Dockerfile
+# PoolForge coordinator image (REST + WebSockets + relay + dashboard).
 #
-# The coordinator is a lightweight FastAPI process — it does NOT run model training.
-# All heavy ML work (PyTorch, tensor ops) is handled by the agent processes that run
-# on participant laptops.  This image therefore skips torch/numpy entirely, keeping
-# the image small (~200 MB vs ~4 GB with torch).
+# The coordinator never runs PyTorch (agents do the training), so the image
+# installs only FastAPI/uvicorn and stays small (~150 MB instead of ~2 GB).
 #
-# Build:
+# Build and run (from the repo root) - ONE command each:
 #   docker build -f deploy/Dockerfile -t poolforge-coordinator .
-# Run:
-#   docker run -p 8000:8000 -v poolforge_data:/app/data poolforge-coordinator
+#   docker run -p 8000:8000 -v poolforge-data:/app/data poolforge-coordinator
+# Then open http://localhost:8000
 
-# ---------------------------------------------------------------------------
-# Stage 1: Dependency layer (separate so pip cache survives code changes)
-# ---------------------------------------------------------------------------
-FROM python:3.11-slim AS deps
+# ---- stage 1: build the React dashboard ----------------------------------
+FROM node:22-alpine AS dashboard
+WORKDIR /build
+COPY dashboard/package.json dashboard/package-lock.json ./
+RUN npm ci --no-audit --no-fund
+COPY dashboard/ ./
+RUN npm run build
 
+# ---- stage 2: Python runtime ----------------------------------------------
+FROM python:3.12-slim
+ENV PYTHONDONTWRITEBYTECODE=1 PYTHONUNBUFFERED=1 \
+    POOLFORGE_DB_PATH=/app/data/poolforge.db POOLFORGE_HOST=0.0.0.0 PORT=8000
 WORKDIR /app
 
-# Only install coordinator-specific dependencies (no torch/heavy ML)
-RUN pip install --no-cache-dir \
-    fastapi \
-    "uvicorn[standard]" \
-    websockets \
-    pydantic \
-    aiofiles \
-    psutil \
-    cryptography
+COPY requirements-coordinator.txt .
+RUN pip install --no-cache-dir -r requirements-coordinator.txt
 
-# ---------------------------------------------------------------------------
-# Stage 2: Runtime image
-# ---------------------------------------------------------------------------
-FROM python:3.11-slim AS runtime
-
-WORKDIR /app
-
-# Copy installed packages from deps stage
-COPY --from=deps /usr/local/lib/python3.11/site-packages /usr/local/lib/python3.11/site-packages
-COPY --from=deps /usr/local/bin /usr/local/bin
-
-# Copy only the coordinator and shared code — do NOT copy agent/ or .venv/
-COPY coordinator/ coordinator/
+# Only what the coordinator needs (no agent/, no torch).
 COPY common/ common/
-COPY dashboard/dist/ dashboard/dist/
+COPY coordinator/ coordinator/
+COPY --from=dashboard /build/dist dashboard/dist
 
-# Persistent storage directory for SQLite database
-RUN mkdir -p /app/data
-
-# ── Environment ──────────────────────────────────────────────────────────────
-# DATABASE_URL can be overridden at runtime (e.g. for a cloud Postgres future)
-ENV DATABASE_URL=sqlite:///./data/poolforge.db
-ENV HOST=0.0.0.0
-ENV PORT=8000
-
-# Expose coordinator WebSocket + REST port
+# Run as an unprivileged user; /app/data holds the SQLite database (mount a volume there).
+RUN useradd --create-home --uid 1000 poolforge && mkdir -p /app/data && chown -R poolforge /app/data
+USER poolforge
+VOLUME ["/app/data"]
 EXPOSE 8000
 
-# ── Healthcheck ───────────────────────────────────────────────────────────────
 HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
-  CMD python -c "import urllib.request; urllib.request.urlopen('http://localhost:8000/health')"
+  CMD python -c "import os,urllib.request; urllib.request.urlopen(f'http://127.0.0.1:{os.environ.get(\"PORT\",\"8000\")}/health')"
 
-# ── Entrypoint ────────────────────────────────────────────────────────────────
-CMD ["uvicorn", "coordinator.server:app", "--host", "0.0.0.0", "--port", "8000"]
+CMD ["python", "-m", "coordinator.server"]
