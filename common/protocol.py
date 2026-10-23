@@ -3,11 +3,20 @@
 Provides secure, pickle-free serialization and framing for PyTorch tensors
 over network transports (Relay and DirectTCP).
 
-Wire Frame Layout:
+Wire Frame Layout (unencrypted):
 +-------------------+--------------------+------------------------+
 | 4-byte uint32     | N-byte JSON Header | M-byte Raw Tensor Data |
 | Big-Endian Length | {kind, dtype, ...} | (IEEE 754 float/int)   |
 +-------------------+--------------------+------------------------+
+
+Wire Frame Layout (encrypted, when key is provided):
++-------------------+--------------------+---------------------------------------+
+| 4-byte uint32     | N-byte JSON Header | 12-byte nonce + AES-GCM ciphertext   |
+| Big-Endian Length | {kind, dtype, ...} | (encrypted raw tensor bytes + 16B tag)|
++-------------------+--------------------+---------------------------------------+
+
+Encryption is optional and only applied to the raw tensor bytes (not the header).
+The JSON header carries an ``encrypted`` flag so receivers know how to decode.
 """
 
 import json
@@ -44,6 +53,7 @@ def serialize_tensor(
     step: int = 0,
     microbatch: int = 0,
     extra: Optional[Dict[str, Any]] = None,
+    encrypt_key: Optional[bytes] = None,
 ) -> bytes:
     """Serialize a PyTorch tensor into the PoolForge binary wire format.
 
@@ -54,6 +64,10 @@ def serialize_tensor(
         step: Current training step.
         microbatch: Micro-batch index within the current step.
         extra: Optional arbitrary JSON-serializable metadata.
+        encrypt_key: Optional 32-byte AES-256 key.  When provided the raw tensor
+            bytes are encrypted with AES-GCM (via ``common.crypto.encrypt_payload``)
+            and the header carries ``"encrypted": true`` so the receiver knows to
+            decrypt.  Pass ``None`` (default) for plaintext transport.
 
     Returns:
         Framed bytes ready for transmission over WebSocket or TCP.
@@ -71,6 +85,14 @@ def serialize_tensor(
     if dtype_str is None:
         raise ValueError(f"Unsupported tensor dtype for wire protocol: {t_cpu.dtype}")
 
+    encrypted = False
+    if encrypt_key is not None:
+        # Only the tensor payload bytes are encrypted; the JSON header stays plaintext
+        # so the receiver can read shape/dtype before decryption.
+        from common.crypto import encrypt_payload
+        raw_bytes = encrypt_payload(raw_bytes, encrypt_key)
+        encrypted = True
+
     header_dict = {
         "kind": kind,
         "dtype": dtype_str,
@@ -79,6 +101,7 @@ def serialize_tensor(
         "step": step,
         "microbatch": microbatch,
         "num_bytes": len(raw_bytes),
+        "encrypted": encrypted,
     }
 
     if extra:
