@@ -6,11 +6,11 @@ out to it.
 ## Option 1: Docker on your own PC or server
 
 ```bash
-docker compose up --build        # builds deploy/Dockerfile, runs on http://localhost:8000
+docker compose up --build        # builds the Dockerfile, runs on http://localhost:8000
 docker compose down              # stop (rooms/history kept in the poolforge-data volume)
 ```
 
-Without compose: `docker build -f deploy/Dockerfile -t poolforge-coordinator .` then
+Without compose: `docker build -t poolforge-coordinator .` then
 `docker run -d -p 8000:8000 -v poolforge-data:/app/data poolforge-coordinator`.
 The image is ~165 MB (no PyTorch: the coordinator never trains). Podman works the same
 (`podman build` / `podman run`); with rootless podman use `http://127.0.0.1:8000`.
@@ -26,8 +26,8 @@ Pick ONE of these two ways.
 ### 2a. Render builds the image from GitHub (auto-redeploys on every push)
 
 1. Push the repo to GitHub.
-2. Render dashboard -> **New -> Blueprint** -> pick the repo (it reads `deploy/render.yaml`
-   and builds `deploy/Dockerfile`). When asked, set `POOLFORGE_REPO_URL` to your GitHub URL.
+2. Render dashboard -> **New -> Blueprint** -> pick the repo (it reads `render.yaml`
+   and builds the `Dockerfile`, both in the repo root). When asked, set `POOLFORGE_REPO_URL` to your GitHub URL.
 3. Wait for the build, then open `https://<name>.onrender.com/health` -> `{"status":"ok"}`.
 
 ### 2b. You build the image, Render just runs it (no GitHub needed on Render)

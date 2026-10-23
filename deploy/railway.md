@@ -3,8 +3,7 @@
 1. Push this repository to GitHub.
 2. On [railway.app](https://railway.app): **New Project -> Deploy from GitHub repo** -> pick it.
 3. In the service **Settings**:
-   - **Builder**: Dockerfile. Set the variable `RAILWAY_DOCKERFILE_PATH=deploy/Dockerfile`
-     (Variables tab) so Railway uses our Dockerfile.
+   - **Builder**: Dockerfile (Railway finds `Dockerfile` in the repo root automatically).
    - **Networking -> Generate Domain** to get `https://<name>.up.railway.app`.
    - Optional: **Volumes -> Add volume** mounted at `/app/data` so rooms and run
      history survive restarts.

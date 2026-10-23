@@ -39,7 +39,7 @@ bench:
 	$(PY) -m benchmarks.run_all
 
 docker:
-	docker build -f deploy/Dockerfile -t poolforge-coordinator .
+	docker build -t poolforge-coordinator .
 
 clean:
 	rm -rf .pytest_cache checkpoints data poolforge.db* build dist *.egg-info

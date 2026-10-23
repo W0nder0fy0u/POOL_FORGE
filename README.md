@@ -53,7 +53,7 @@ an MNIST CNN starts training across them, and the loss falls live.
 Render/Railway, then share the join link. See [docs/DEPLOY.md](docs/DEPLOY.md).
 
 ```bash
-docker build -f deploy/Dockerfile -t poolforge-coordinator . && docker run -p 8000:8000 -v poolforge-data:/app/data poolforge-coordinator
+docker build -t poolforge-coordinator . && docker run -p 8000:8000 -v poolforge-data:/app/data poolforge-coordinator
 ```
 
 ## How it works
@@ -120,7 +120,8 @@ coordinator/  FastAPI server, hub (live state + job lifecycle), scheduler, SQLit
 common/       wire protocol, transports, layer specs, model zoo, datasets, pipeline engine, schemas, crypto
 dashboard/    React + Vite + Recharts (src/) and the built site (dist/)
 benchmarks/   harness + run_all + results/
-deploy/       Dockerfile, render.yaml, railway.md, PyInstaller spec, sample apps
+Dockerfile    coordinator image (Render/Railway build it by default); render.yaml = Render blueprint
+deploy/       railway.md, PyInstaller spec, sample apps
 docs/         architecture, protocol, decisions, limitations, demo, deploy, screenshots
 scripts/      dev_two_agents.sh / .ps1
 tests/        pytest suite (phases 0-8)

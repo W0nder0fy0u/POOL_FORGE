@@ -1,11 +1,11 @@
 # Render.com blueprint for the PoolForge coordinator.
 # Render -> New -> Blueprint -> pick this repo. (Or New -> Web Service -> Docker,
-# Dockerfile path: deploy/Dockerfile.) WebSockets work out of the box on Render.
+# Dockerfile path: ./Dockerfile, the default.) WebSockets work out of the box on Render.
 services:
   - type: web
     name: poolforge
     runtime: docker
-    dockerfilePath: ./deploy/Dockerfile
+    dockerfilePath: ./Dockerfile
     dockerContext: .
     plan: free            # free tier sleeps after ~15 min idle; first request wakes it (~30 s)
     healthCheckPath: /health

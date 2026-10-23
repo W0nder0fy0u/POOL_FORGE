@@ -26,7 +26,7 @@ echo "== Building $IMAGE with $ENGINE (linux/amd64, what Render runs)"
 # --format docker keeps the HEALTHCHECK when building with podman.
 EXTRA=""
 [[ "$ENGINE" == "podman" ]] && EXTRA="--format docker"
-$ENGINE build $EXTRA --platform linux/amd64 -f deploy/Dockerfile -t "$IMAGE" .
+$ENGINE build $EXTRA --platform linux/amd64 -f Dockerfile -t "$IMAGE" .
 
 echo "== Quick self-test: start the image and call /health"
 CID=$($ENGINE run -d -p 127.0.0.1:18000:8000 "$IMAGE")

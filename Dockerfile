@@ -4,7 +4,7 @@
 # installs only FastAPI/uvicorn and stays small (~150 MB instead of ~2 GB).
 #
 # Build and run (from the repo root) - ONE command each:
-#   docker build -f deploy/Dockerfile -t poolforge-coordinator .
+#   docker build -t poolforge-coordinator .
 #   docker run -p 8000:8000 -v poolforge-data:/app/data poolforge-coordinator
 # Then open http://localhost:8000
 

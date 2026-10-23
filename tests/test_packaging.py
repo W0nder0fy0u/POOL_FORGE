@@ -37,7 +37,7 @@ def test_coordinator_requirements_have_no_torch():
 
 
 def test_dockerfile_copies_only_coordinator_side():
-    text = (ROOT / "deploy" / "Dockerfile").read_text()
+    text = (ROOT / "Dockerfile").read_text()
     assert "COPY coordinator/" in text and "COPY common/" in text
     assert "COPY agent/" not in text and "requirements-coordinator.txt" in text
 

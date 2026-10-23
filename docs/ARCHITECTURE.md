@@ -50,7 +50,7 @@ flowchart LR
 | `agent/` | `cli.py` (`poolforge` command), `worker.py` (connection and messages), `trainer.py` (runs one stage), `hosting.py` (Deploy tab) |
 | `dashboard/` | React + Vite + Recharts source (`src/`) and the build (`dist/`) served by the coordinator |
 | `benchmarks/` | `harness.py` (real processes driven via REST), `run_all.py`, `results/` |
-| `deploy/` | Dockerfile, Render/Railway configs, PyInstaller spec, sample apps |
+| `Dockerfile`, `render.yaml` (repo root), `deploy/` | coordinator image, Render blueprint, Railway notes, PyInstaller spec, sample apps |
 
 ## Control plane vs data plane
 
