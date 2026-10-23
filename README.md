@@ -142,3 +142,4 @@ poolforge join CODE --server URL [--ram-cap-gb N] [--transport relay|tcp] [--nod
                [--encrypt-passphrase PASS] [--threads N] [--workdir DIR]
 python -m coordinator.server          # env: PORT / POOLFORGE_PORT, POOLFORGE_DB_PATH, ... (.env.example)
 ```
+# POOL_FORGE
