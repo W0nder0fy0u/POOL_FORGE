@@ -46,12 +46,14 @@ class AgentWorker:
         self.simulate_latency_ms = simulate_latency_ms
         self.device = torch.device(device)
 
-        self.status = "idle"  # "idle" | "training" | "hosting"
+        self.status = "idle"  # "idle" | "training" | "hosting" | "paused"
         self._running = False
         self._ws: Optional[websockets.WebSocketClientProtocol] = None
         self._active_job_task: Optional[asyncio.Task] = None
         self._current_stage: Optional[PipelineStage] = None
         self._direct_tcp: Optional[DirectTCPTransport] = None
+        self._pause_event = asyncio.Event()
+        self._pause_event.set()
 
     def get_telemetry(self) -> NodeTelemetry:
         """Poll host memory, CPU, and platform details."""
@@ -150,6 +152,16 @@ class AgentWorker:
                             self._active_job_task.cancel()
                         self.status = "idle"
 
+                    elif mtype == "pause":
+                        logger.info("Received pause signal from coordinator")
+                        self._pause_event.clear()
+                        self.status = "paused"
+
+                    elif mtype == "resume":
+                        logger.info("Received resume signal from coordinator")
+                        self._pause_event.set()
+                        self.status = "training"
+
             finally:
                 heartbeat_task.cancel()
 
@@ -232,6 +244,8 @@ class AgentWorker:
 
         try:
             for step in range(total_steps):
+                # Check for pause before starting step
+                await self._pause_event.wait()
                 t_start = time.perf_counter()
                 stage.zero_grad()
 

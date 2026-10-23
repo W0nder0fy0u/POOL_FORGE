@@ -58,6 +58,28 @@ UINT32_STRUCT = struct.Struct(">I")
 
 # In-memory active job tracker: room_code -> job_id
 active_room_jobs: Dict[str, str] = {}
+# Active job metadata: job_id -> dict
+job_registry: Dict[str, Dict[str, Any]] = {}
+# Drop grace timers: (room_code, node_id) -> asyncio.Task
+node_drop_tasks: Dict[tuple[str, str], asyncio.Task] = {}
+
+# Simple in-memory rate limiter: ip -> list of timestamps
+rate_limit_history: Dict[str, list[float]] = {}
+
+
+def check_rate_limit(client_ip: str, max_requests: int = 20, window_seconds: float = 10.0) -> None:
+    """Enforce request rate limiting per IP address."""
+    now = time.time()
+    history = rate_limit_history.get(client_ip, [])
+    # Filter within window
+    history = [t for t in history if now - t < window_seconds]
+    if len(history) >= max_requests:
+        raise HTTPException(
+            status_code=429,
+            detail=f"Rate limit exceeded: max {max_requests} requests per {window_seconds}s",
+        )
+    history.append(now)
+    rate_limit_history[client_ip] = history
 
 
 def generate_room_code(length: int = 6) -> str:
@@ -158,6 +180,15 @@ async def start_training(
 
     job_id = f"job_{room_code}_{int(time.time())}"
     active_room_jobs[room_code] = job_id
+    job_registry[job_id] = {
+        "job_id": job_id,
+        "room_code": room_code,
+        "split_plan": split_plan,
+        "nodes": [s.node_id for s in split_plan],
+        "status": "running",
+        "last_step": 0,
+        "config": req.model_dump(),
+    }
     db.create_job(job_id, room_code, req.model_name, req.model_dump())
 
     # Build peer TCP address dictionary for DirectTCP transports
@@ -239,6 +270,74 @@ async def stop_training(
     return {"status": "stopped", "job_id": job_id}
 
 
+@app.post("/api/rooms/{room_code}/pause")
+async def pause_training(
+    room_code: str,
+    x_admin_token: Optional[str] = Header(None, alias="X-Admin-Token"),
+    admin_token: Optional[str] = Query(None),
+):
+    """Pause currently executing training job."""
+    room = db.get_room(room_code)
+    if not room:
+        raise HTTPException(status_code=404, detail="Room not found")
+
+    token = x_admin_token or admin_token
+    if token != room["admin_token"]:
+        raise HTTPException(status_code=403, detail="Invalid admin token")
+
+    job_id = active_room_jobs.get(room_code)
+    if not job_id:
+        raise HTTPException(status_code=400, detail="No active job to pause")
+
+    if job_id in job_registry:
+        job_registry[job_id]["status"] = "paused"
+    db.update_job_status(job_id, "paused")
+
+    for (r_code, node_id), ws in list(agent_sockets.items()):
+        if r_code == room_code:
+            try:
+                await ws.send_text(json.dumps({"type": "pause", "job_id": job_id}))
+            except Exception:
+                pass
+
+    await broadcast_to_dashboard(room_code, {"type": "job_paused", "job_id": job_id})
+    return {"status": "paused", "job_id": job_id}
+
+
+@app.post("/api/rooms/{room_code}/resume")
+async def resume_training(
+    room_code: str,
+    x_admin_token: Optional[str] = Header(None, alias="X-Admin-Token"),
+    admin_token: Optional[str] = Query(None),
+):
+    """Resume paused training job."""
+    room = db.get_room(room_code)
+    if not room:
+        raise HTTPException(status_code=404, detail="Room not found")
+
+    token = x_admin_token or admin_token
+    if token != room["admin_token"]:
+        raise HTTPException(status_code=403, detail="Invalid admin token")
+
+    job_id = active_room_jobs.get(room_code)
+    if not job_id:
+        raise HTTPException(status_code=400, detail="No active job to resume")
+
+    if job_id in job_registry:
+        job_registry[job_id]["status"] = "running"
+    db.update_job_status(job_id, "running")
+
+    for (r_code, node_id), ws in list(agent_sockets.items()):
+        if r_code == room_code:
+            try:
+                await ws.send_text(json.dumps({"type": "resume", "job_id": job_id}))
+            except Exception:
+                pass
+
+    await broadcast_to_dashboard(room_code, {"type": "job_resumed", "job_id": job_id})
+    return {"status": "resumed", "job_id": job_id}
+
+
 @app.post("/api/rooms/{room_code}/report_metric")
 async def report_metric(room_code: str, metric: StepMetric):
     """Receive step telemetry emitted by the last pipeline stage."""
@@ -279,6 +378,28 @@ async def agent_control_websocket(websocket: WebSocket, room_code: str, node_id:
     agent_sockets[(room_code, node_id)] = websocket
     logger.info(f"Agent [{node_id}] connected to control plane for room {room_code}")
 
+    # Check if this node was missing for an active paused job
+    job_id = active_room_jobs.get(room_code)
+    drop_key = (room_code, node_id)
+    if drop_key in node_drop_tasks:
+        drop_task = node_drop_tasks.pop(drop_key)
+        drop_task.cancel()
+        logger.info(f"Node [{node_id}] returned before timeout! Resuming job {job_id}")
+        if job_id and job_id in job_registry:
+            job_registry[job_id]["status"] = "running"
+            db.update_job_status(job_id, "running")
+            # Notify agents to resume
+            for (r_code, n_id), ws in list(agent_sockets.items()):
+                if r_code == room_code:
+                    try:
+                        await ws.send_text(json.dumps({"type": "resume", "job_id": job_id}))
+                    except Exception:
+                        pass
+            await broadcast_to_dashboard(
+                room_code,
+                {"type": "job_resumed", "job_id": job_id, "returned_node": node_id},
+            )
+
     try:
         while True:
             text_data = await websocket.receive_text()
@@ -303,6 +424,66 @@ async def agent_control_websocket(websocket: WebSocket, room_code: str, node_id:
             room_code,
             {"type": "node_left", "node_id": node_id},
         )
+
+        # Robust Node-Drop Handling: If an active job is running, pause it and wait with a grace timer
+        current_job_id = active_room_jobs.get(room_code)
+        if current_job_id and current_job_id in job_registry:
+            job_info = job_registry[current_job_id]
+            if node_id in job_info.get("nodes", []):
+                logger.warning(
+                    f"Participating node [{node_id}] dropped during active job {current_job_id}! Pausing job..."
+                )
+                job_info["status"] = "paused"
+                db.update_job_status(current_job_id, "paused")
+
+                # Instruct remaining agents to pause
+                for (r_code, n_id), ws in list(agent_sockets.items()):
+                    if r_code == room_code:
+                        try:
+                            await ws.send_text(
+                                json.dumps(
+                                    {
+                                        "type": "pause",
+                                        "job_id": current_job_id,
+                                        "reason": f"Node {node_id} dropped",
+                                    }
+                                )
+                            )
+                        except Exception:
+                            pass
+
+                await broadcast_to_dashboard(
+                    room_code,
+                    {
+                        "type": "job_paused",
+                        "job_id": current_job_id,
+                        "dropped_node": node_id,
+                        "grace_seconds": 10.0,
+                    },
+                )
+
+                async def _grace_timeout_handler():
+                    try:
+                        await asyncio.sleep(10.0)
+                        if drop_key in node_drop_tasks:
+                            logger.error(f"Node [{node_id}] failed to return within 10s grace period. Failing job {current_job_id}")
+                            job_info["status"] = "failed"
+                            db.update_job_status(current_job_id, "failed")
+                            active_room_jobs.pop(room_code, None)
+                            node_drop_tasks.pop(drop_key, None)
+                            await broadcast_to_dashboard(
+                                room_code,
+                                {
+                                    "type": "job_failed",
+                                    "job_id": current_job_id,
+                                    "reason": f"Node {node_id} disconnected and timed out",
+                                },
+                            )
+                    except asyncio.CancelledError:
+                        pass
+
+                drop_task = asyncio.create_task(_grace_timeout_handler())
+                node_drop_tasks[drop_key] = drop_task
 
 
 @app.websocket("/ws/relay/{room_code}/{node_id}")
