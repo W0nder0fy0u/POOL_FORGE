@@ -14,6 +14,8 @@ services:
         value: "30"
       - key: LOG_LEVEL
         value: INFO
+      - key: POOLFORGE_REPO_URL   # git URL shown on the Join page (set it in the Render dashboard)
+        sync: false
     # The free plan has no persistent disk: rooms/run history reset on every deploy or restart.
     # On a paid plan, uncomment to keep the SQLite database:
     # disk:

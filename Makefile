@@ -7,18 +7,20 @@
 #   make bench      run all benchmarks (CSV + PNG into benchmarks/results)
 # On Windows without make, use scripts\*.ps1 or the raw commands below.
 
+# Use the project venv if it exists, otherwise whatever python3 is on PATH.
 ifeq ($(OS),Windows_NT)
-    PY := .venv/Scripts/python.exe
+    VENV_PY := .venv/Scripts/python.exe
 else
-    PY := .venv/bin/python
+    VENV_PY := .venv/bin/python
 endif
+PY := $(if $(wildcard $(VENV_PY)),$(VENV_PY),python3)
 
 .PHONY: setup test dev demo dashboard bench docker clean
 
 setup:
 	python3 -m venv .venv
-	$(PY) -m pip install -r requirements.txt
-	$(PY) -m pip install -e .
+	$(VENV_PY) -m pip install -r requirements.txt
+	$(VENV_PY) -m pip install -e .
 	cd dashboard && npm install && npm run build
 
 test:

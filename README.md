@@ -1,82 +1,144 @@
-# PoolForge ⚡
+# PoolForge
 
-> **Pools laptops' spare RAM/compute to train AI models and host apps together.**  
-> An MCA Final Year Capstone Project.
+**Pool laptops' spare RAM and compute to train AI models and host apps together.**
+MCA project. Python (PyTorch, FastAPI) + React. Runs on Windows and Linux.
 
-[![Tests](https://img.shields.io/badge/tests-passing-brightgreen)]()
-[![Python](https://img.shields.io/badge/python-3.10%20%7C%203.11%20%7C%203.12%20%7C%203.14-blue)]()
-[![Platform](https://img.shields.io/badge/platform-Windows%20%7C%20Linux-lightgrey)]()
+Two or more laptops, anywhere, join one *pool* through a link. A neural network is
+split **by layers** across them (pipeline parallelism), so no laptop has to hold the
+whole model. A live dashboard starts and stops training, shows loss, speed, RAM and
+network traffic, and can deploy small web apps onto pool laptops.
 
----
+> **Honest summary.** RAM is not literally merged: each laptop stores *part* of the
+> model, so together they fit a model none could fit alone (**1.75x larger** in our
+> benchmark). But every step must cross the network, so training is **slower** than on
+> one laptop (18% on localhost, ~2x with 50 ms latency). See
+> [benchmarks/results/results.md](benchmarks/results/results.md).
 
-## 📖 Overview
-PoolForge allows two or more student laptops on separate networks to pool their spare memory and compute into a single virtual cluster.
-- **Distributed Pipeline Parallelism**: AI models are split by layer across nodes so no single laptop holds the full model in memory.
-- **Zero Config NAT Traversal**: Outbound WebSocket relay connects machines behind campus Wi-Fi or home routers without port forwarding or VPNs.
-- **Live Real-Time Dashboard**: Control training, watch loss convergence, monitor per-node RAM and CPU, and inspect network throughput live.
-- **Edge App Hosting**: Deploy lightweight microservices and web apps onto pool nodes with automatic Cloudflare tunneling.
+| Training (light theme) | Training (dark theme) |
+|---|---|
+| ![training](docs/screenshots/training.png) | ![training dark](docs/screenshots/training-dark.png) |
+| **Nodes** | **Network** |
+| ![nodes](docs/screenshots/nodes.png) | ![network](docs/screenshots/network.png) |
 
----
+## Quick start (about 5 minutes)
 
-## 🚀 Quick Start (Under 10 Minutes)
+Needs **Python 3.10+** and Git. Node.js is NOT needed (the dashboard is pre-built).
 
-### 1. Prerequisites
-- Python 3.10+
-- Git
-
-### 2. Installation
 ```bash
-git clone https://github.com/poolforge/poolforge.git
-cd poolforge
-
-# Setup virtual environment
-python3 -m venv .venv
-source .venv/bin/activate  # On Windows: .venv\Scripts\activate
-
-# Install dependencies
-pip install -r requirements.txt
-pip install -e agent
+git clone <this repo> poolforge && cd poolforge
+python -m venv .venv
+source .venv/bin/activate          # Windows: .venv\Scripts\activate
+pip install -r requirements.txt    # PyTorch etc. (the biggest download)
+pip install -e .                   # installs the `poolforge` command
 ```
 
-### 3. Run Coordinator & Dashboard
+**See it all on one machine (coordinator + 2 simulated laptops):**
+
 ```bash
-# Starts coordinator on http://localhost:8000
-python3 -m coordinator.server
+bash scripts/dev_two_agents.sh --train                                   # Linux / macOS / Git Bash
+powershell -ExecutionPolicy Bypass -File scripts\dev_two_agents.ps1 -Train  # Windows
 ```
 
-### 4. Join Worker Nodes
+Open the printed **Dashboard** link. Two nodes appear (capped at 1 GB and 2 GB),
+an MNIST CNN starts training across them, and the loss falls live.
+
+**Or step by step:**
+
+1. `python -m coordinator.server`, then open http://localhost:8000 and click **Create Pool**.
+2. In two other terminals (or on two laptops on the same Wi-Fi, using the first laptop's IP):
+   `poolforge join <CODE> --server http://localhost:8000 --ram-cap-gb 1`
+3. In the dashboard: **Training -> Preview split -> Start**.
+
+**Friends on other networks:** deploy the coordinator with one Docker command or on
+Render/Railway, then share the join link. See [docs/DEPLOY.md](docs/DEPLOY.md).
+
 ```bash
-# In another terminal / laptop:
-poolforge join <ROOM_CODE> --server http://localhost:8000
+docker build -f deploy/Dockerfile -t poolforge-coordinator . && docker run -p 8000:8000 -v poolforge-data:/app/data poolforge-coordinator
 ```
 
----
+## How it works
 
-## 🧪 Running Tests
-```bash
-make test
-# or
-pytest -v tests
+```mermaid
+flowchart LR
+  B[Browser dashboard] -- "REST + live WebSocket" --> C["Coordinator<br/>FastAPI + SQLite<br/>(rooms, scheduler, relay)"]
+  A1["Laptop A agent<br/>layers 0..k"] -- "control WS + tensor relay (outbound)" --> C
+  A2["Laptop B agent<br/>layers k..n"] -- "control WS + tensor relay (outbound)" --> C
+  A1 -. "direct TCP (LAN, optional)" .- A2
 ```
 
----
+1. **Join.** `poolforge join CODE` connects *outbound* (no port forwarding) and gets a secret node token.
+2. **Plan.** The coordinator estimates each layer's memory
+   (`params x 4 B x 4 + activation x batch x 4 B`) and gives each laptop a contiguous
+   block of layers proportional to its free RAM, or replies **"pool too small"**.
+3. **Train.** Laptop A runs its layers and sends `out.detach()` forward. Laptop B
+   receives it, calls `requires_grad_()`, computes the loss, calls `backward()` and
+   sends `inp.grad` back. Laptop A calls `out.backward(grad)`. Each laptop updates
+   its own weights. The losses equal normal single-process training (tested to 1e-5).
+4. **Watch.** Every step reports loss, time, bytes and RAM to the dashboard.
+5. **Survive.** If a laptop drops, the job pauses and resumes from the last common
+   checkpoint when it returns, or fails cleanly after 30 s.
 
-## 📂 Project Structure
+Tensors travel as `[4-byte length][JSON header][raw bytes]`: **never pickle**.
+Details: [ARCHITECTURE](docs/ARCHITECTURE.md) | [PROTOCOL](docs/PROTOCOL.md) | [DECISIONS](docs/DECISIONS.md) | [LIMITATIONS](docs/LIMITATIONS.md) | [VIVA DEMO](docs/DEMO.md)
+
+## Features
+
+| Area | What you get |
+|---|---|
+| Pooling | N-stage pipeline, auto split by free RAM, `--ram-cap-gb` to simulate small laptops, micro-batching |
+| Models | `tiny`, `mnist_mlp`, `mnist_cnn` (real MNIST, offline synthetic fallback), `large_mlp` (width/depth configurable) |
+| Transports | Relay through the coordinator (works anywhere) or direct TCP (`--transport tcp`); `--simulate-latency-ms` |
+| Dashboard | Home, Join, Nodes, Training, Network, Deploy, Reports (CSV/JSON); orange light/dark theme, mobile friendly |
+| Robustness | Auto-reconnect with backoff, checkpoints every K steps, pause/resume/stop, node-drop resume, heartbeat timeout |
+| Security | Node + admin tokens (hashed), room lock, rate limits, pydantic validation, no pickle, allow-listed hosting, optional AES-256-GCM (`--encrypt-passphrase`) |
+| Hosting | Static site / Flask / allow-listed Docker images on a pool laptop, Cloudflare quick-tunnel URL or IP:port fallback |
+| Packaging | Docker image (164 MB, no torch), Render/Railway configs, PyInstaller `poolforge-agent` |
+
+## Tests and benchmarks
+
+```bash
+make test                      # or: python -m pytest -q   (74 tests, ~45 s)
+python -m benchmarks.run_all   # ~3 min -> benchmarks/results/*.csv, *.png, raw_tables.md
+```
+
+The key correctness test is `tests/test_split_training.py::test_split_loss_equals_single_process`.
+
+| Benchmark (one PC, 4 threads per "laptop") | Result |
+|---|---|
+| a. Capacity, 0.3 GB per laptop | 1 laptop: up to 12.5M params; 2-laptop pool: up to 31M |
+| b. Model RAM per node | 526 MB single -> 409 / 361 MB pooled |
+| c. Speed | 7.08 -> 5.81 steps/s (pool is slower) |
+| d. Relay vs TCP | 177 vs 132 ms/step |
+| e. Latency 0/20/50/100 ms | 1.0x / 1.45x / 2.09x / 3.18x step time |
+| f. Micro-batching | M=2 saves 3.4% at 50 ms latency; M>2 is slower |
+
+## Project layout
+
 ```text
-poolforge/
-├── agent/            # Python CLI worker (runs pipeline stages, reports stats)
-├── coordinator/      # FastAPI + SQLite + WebSocket control plane & relay
-├── dashboard/        # React + Vite + Recharts live web interface
-├── common/           # Shared schemas, tensor framing wire format, model specs
-├── benchmarks/       # Capacity, latency, and throughput benchmark scripts
-├── deploy/           # Dockerfile and cloud deployment templates
-├── docs/             # Technical docs, viva viva demo guide, limitations
-├── scripts/          # Helper scripts for multi-agent local simulation
-└── tests/            # Test suite (unit, integration, equivalence)
+agent/        poolforge CLI: worker (connection), trainer (one stage), hosting (apps)
+coordinator/  FastAPI server, hub (live state + job lifecycle), scheduler, SQLite
+common/       wire protocol, transports, layer specs, model zoo, datasets, pipeline engine, schemas, crypto
+dashboard/    React + Vite + Recharts (src/) and the built site (dist/)
+benchmarks/   harness + run_all + results/
+deploy/       Dockerfile, render.yaml, railway.md, PyInstaller spec, sample apps
+docs/         architecture, protocol, decisions, limitations, demo, deploy, screenshots
+scripts/      dev_two_agents.sh / .ps1
+tests/        pytest suite (phases 0-8)
 ```
 
----
+## Developing the dashboard
 
-## ⚖️ Honest Engineering Trade-offs
-1. **RAM is not literally merged**: Nodes hold partitions of the model weights and Adam optimizer states. Communication latency between layers is bounded by the network connection.
-2. **Step Latency**: Step time increases over WAN/relay compared to single-machine training. The pool allows models that physically exceed a single laptop's RAM to train successfully.
+```bash
+cd dashboard && npm install
+npm run dev      # http://localhost:5173, proxies /api and /ws to the coordinator on :8000
+npm run build    # writes dashboard/dist (commit it so users don't need Node)
+```
+
+## Commands
+
+```text
+poolforge join CODE --server URL [--ram-cap-gb N] [--transport relay|tcp] [--node-id NAME]
+               [--advertise-host IP] [--tcp-port P] [--simulate-latency-ms MS]
+               [--encrypt-passphrase PASS] [--threads N] [--workdir DIR]
+python -m coordinator.server          # env: PORT / POOLFORGE_PORT, POOLFORGE_DB_PATH, ... (.env.example)
+```

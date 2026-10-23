@@ -36,7 +36,7 @@ export default function Join() {
             <section className="card stack">
               <div>
                 <h3>Step 1 - one-time setup (Python 3.10+)</h3>
-                <CopyBox text={"git clone <this project's repo URL> poolforge\ncd poolforge\npip install -e ."} />
+                <CopyBox text={`git clone ${info.repo_url || "<PoolForge repo URL - ask the pool admin>"} poolforge\ncd poolforge\npip install -e .`} />
                 <p className="muted small">Already set up? Skip to step 2. On Windows use PowerShell or cmd; the commands are the same.</p>
               </div>
               <div>

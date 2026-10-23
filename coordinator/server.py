@@ -169,6 +169,7 @@ def create_app(db_path: Optional[str] = None, drop_grace_s: Optional[float] = No
         snap = hub.snapshot(room)
         snap["join_command"] = f"poolforge join {code} --server {public_url(request)}"
         snap["server"] = public_url(request)
+        snap["repo_url"] = os.environ.get("POOLFORGE_REPO_URL", "")  # shown on the Join page
         return snap
 
     @app.post("/api/rooms/{code}/join", response_model=JoinResponse)
