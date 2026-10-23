@@ -1,0 +1,5 @@
+one_way_latency_ms,avg_step_ms,steps_per_s,slowdown_vs_0ms,expected_extra_ms(2 hops)
+0,89.2,11.22,1.0,0
+20,128.8,7.76,1.45,40
+50,186.1,5.37,2.09,100
+100,283.7,3.52,3.18,200

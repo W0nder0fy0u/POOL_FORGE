@@ -66,8 +66,9 @@ def create_app(db_path: Optional[str] = None, drop_grace_s: Optional[float] = No
     """Build the app. Tests call this to get a fresh coordinator with its own DB."""
     db = DB(db_path or os.environ.get("POOLFORGE_DB_PATH", "data/poolforge.db"))
     hub = Hub(db, drop_grace_s=drop_grace_s if drop_grace_s is not None else float(os.environ.get("POOLFORGE_DROP_GRACE_S", 30)))
-    create_limiter = RateLimiter(limit=10, window=60)  # rooms created per IP per minute
-    join_limiter = RateLimiter(limit=20, window=60)  # join attempts per IP per minute
+    # Rate limits per IP per minute (env vars let benchmarks/tests raise them).
+    create_limiter = RateLimiter(limit=int(os.environ.get("POOLFORGE_ROOMS_PER_MIN", 10)), window=60)
+    join_limiter = RateLimiter(limit=int(os.environ.get("POOLFORGE_JOINS_PER_MIN", 20)), window=60)
 
     @asynccontextmanager
     async def lifespan(_app: FastAPI):

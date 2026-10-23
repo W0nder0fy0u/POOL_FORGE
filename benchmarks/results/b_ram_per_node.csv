@@ -1,0 +1,4 @@
+setup,node,layers,peak_agent_ram_mb,idle_agent_ram_mb,model_ram_mb,avg_step_ms,steps_per_s
+single node,node0,0-17,1131,605,526,141.3,7.08
+2-node pool,node0,0-9,1015,605,409,172.2,5.81
+2-node pool,node1,10-17,966,605,361,172.2,5.81

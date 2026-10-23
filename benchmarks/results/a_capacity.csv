@@ -1,0 +1,7 @@
+width,params_millions,estimated_mb,cap_per_node_gb,single_node,pool_2_nodes,pool_step_ms,pool_measured_model_ram_mb
+1024,8.16,129,0.3,trained,trained,102.1,583
+1280,12.5,196,0.3,trained,trained,144.5,667
+1536,17.75,277,0.3,pool too small,trained,191.5,783
+1792,23.92,372,0.3,pool too small,trained,244.6,872
+2048,31.0,481,0.3,pool too small,trained,296.4,1006
+2304,39.01,604,0.3,pool too small,pool too small,,
