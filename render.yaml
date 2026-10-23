@@ -1,24 +1,23 @@
-# Render.com blueprint for the PoolForge coordinator.
-# Render -> New -> Blueprint -> pick this repo. (Or New -> Web Service -> Docker,
-# Dockerfile path: ./Dockerfile, the default.) WebSockets work out of the box on Render.
+# Render.com blueprint for the PoolForge coordinator (native Python, no Docker).
+# Render -> New -> Blueprint -> pick this repo.
+# Or by hand: New -> Web Service -> Language: Python 3, with the build/start commands below.
+#
+# The dashboard is pre-built in dashboard/dist (committed), so no Node.js is needed,
+# and the coordinator does not use PyTorch, so the install is small and fast.
 services:
   - type: web
     name: poolforge
-    runtime: docker
-    dockerfilePath: ./Dockerfile
-    dockerContext: .
+    runtime: python
     plan: free            # free tier sleeps after ~15 min idle; first request wakes it (~30 s)
+    buildCommand: pip install -r requirements-coordinator.txt
+    startCommand: python -m coordinator.server
     healthCheckPath: /health
     envVars:
+      - key: PYTHON_VERSION
+        value: "3.12.8"
       - key: POOLFORGE_DROP_GRACE_S
         value: "30"
       - key: LOG_LEVEL
         value: INFO
       - key: POOLFORGE_REPO_URL   # git URL shown on the Join page (set it in the Render dashboard)
         sync: false
-    # The free plan has no persistent disk: rooms/run history reset on every deploy or restart.
-    # On a paid plan, uncomment to keep the SQLite database:
-    # disk:
-    #   name: poolforge-data
-    #   mountPath: /app/data
-    #   sizeGB: 1

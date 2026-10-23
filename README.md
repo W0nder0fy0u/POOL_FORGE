@@ -120,7 +120,7 @@ coordinator/  FastAPI server, hub (live state + job lifecycle), scheduler, SQLit
 common/       wire protocol, transports, layer specs, model zoo, datasets, pipeline engine, schemas, crypto
 dashboard/    React + Vite + Recharts (src/) and the built site (dist/)
 benchmarks/   harness + run_all + results/
-Dockerfile    coordinator image (Render/Railway build it by default); render.yaml = Render blueprint
+Dockerfile    optional coordinator image; render.yaml = Render blueprint (native Python, no Docker)
 deploy/       railway.md, PyInstaller spec, sample apps
 docs/         architecture, protocol, decisions, limitations, demo, deploy, screenshots
 scripts/      dev_two_agents.sh / .ps1

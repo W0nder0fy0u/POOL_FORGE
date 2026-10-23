@@ -21,16 +21,32 @@ See `.env.example`.
 
 ## Option 2: Render (free, public HTTPS URL)
 
-Pick ONE of these two ways.
+Pick ONE of these ways.
 
-### 2a. Render builds the image from GitHub (auto-redeploys on every push)
+### 2-native. Plain Python, no Docker (simplest)
 
 1. Push the repo to GitHub.
-2. Render dashboard -> **New -> Blueprint** -> pick the repo (it reads `render.yaml`
-   and builds the `Dockerfile`, both in the repo root). When asked, set `POOLFORGE_REPO_URL` to your GitHub URL.
+2. Render dashboard -> **New -> Web Service** -> pick the repo, then set:
+   - **Language**: Python 3
+   - **Build Command**: `pip install -r requirements-coordinator.txt`
+   - **Start Command**: `python -m coordinator.server`
+   - **Instance Type**: Free
+   - **Environment**: `PYTHON_VERSION` = `3.12.8`, optionally `POOLFORGE_REPO_URL` = your GitHub URL
+   - **Health Check Path** (Advanced): `/health`
+   (Or **New -> Blueprint**: `render.yaml` in the repo root has exactly these settings.)
+3. Open `https://<name>.onrender.com/health` -> `{"status":"ok"}`.
+
+The dashboard is pre-built in `dashboard/dist`, so no Node.js step is needed. If you
+change the dashboard, run `cd dashboard && npm run build` and commit `dist/`.
+
+### 2a. Docker: Render builds the image from GitHub
+
+1. Push the repo to GitHub.
+2. Render dashboard -> **New -> Web Service** -> pick the repo -> **Language: Docker**
+   (it builds the `Dockerfile` in the repo root). Set `POOLFORGE_REPO_URL` to your GitHub URL.
 3. Wait for the build, then open `https://<name>.onrender.com/health` -> `{"status":"ok"}`.
 
-### 2b. You build the image, Render just runs it (no GitHub needed on Render)
+### 2b. Docker: you build the image, Render just runs it
 
 1. Create a free account on [hub.docker.com](https://hub.docker.com).
 2. Build, self-test and push in one command (asks for your Docker Hub login once):
