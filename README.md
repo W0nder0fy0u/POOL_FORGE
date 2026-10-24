@@ -32,6 +32,14 @@ pip install -r requirements.txt    # PyTorch etc. (the biggest download)
 pip install -e .                   # installs the `poolforge` command
 ```
 
+Windows: use `py -m venv .venv` and `.venv\Scripts\activate` (PowerShell may need
+`Set-ExecutionPolicy -Scope CurrentUser RemoteSigned` once). NVIDIA GPU on Windows: run
+`pip install torch --index-url https://download.pytorch.org/whl/cu126` before the
+requirements, because the default Windows PyTorch is CPU-only. Linux needs nothing extra.
+
+**Friends joining a pool** don't need this repo: the Join page shows exact Windows and
+Linux/macOS commands that install the agent from the coordinator into a `poolforge-env` folder.
+
 **See it all on one machine (coordinator + 2 simulated laptops):**
 
 ```bash
@@ -85,7 +93,9 @@ Details: [ARCHITECTURE](docs/ARCHITECTURE.md) | [PROTOCOL](docs/PROTOCOL.md) | [
 
 | Area | What you get |
 |---|---|
-| Pooling | N-stage pipeline, auto split by free RAM, `--ram-cap-gb` to simulate small laptops, micro-batching |
+| Pooling | N-stage pipeline, auto split by free RAM (or free VRAM on GPU nodes), `--ram-cap-gb` / `--vram-cap-gb`, micro-batching |
+| GPU | Each node trains its layers on its own GPU (NVIDIA/AMD via CUDA/ROCm, Apple MPS) automatically; GPU and CPU laptops mix in one pipeline; `--device cpu` opts out |
+| Chat & voice | Room chat and a browser voice call (WebRTC, peer to peer) in a side panel on every dashboard tab; optional TURN for strict networks |
 | Models | `tiny`, `mnist_mlp`, `mnist_cnn` (real MNIST, offline synthetic fallback), `large_mlp` (width/depth configurable) |
 | Transports | Relay through the coordinator (works anywhere) or direct TCP (`--transport tcp`); `--simulate-latency-ms` |
 | Dashboard | Home, Join, Nodes, Training, Network, Deploy, Reports (CSV/JSON); orange light/dark theme, mobile friendly |
@@ -138,7 +148,8 @@ npm run build    # writes dashboard/dist (commit it so users don't need Node)
 ## Commands
 
 ```text
-poolforge join CODE --server URL [--ram-cap-gb N] [--transport relay|tcp] [--node-id NAME]
+poolforge join CODE --server URL [--ram-cap-gb N] [--device auto|cpu|cuda|mps] [--vram-cap-gb N]
+               [--transport relay|tcp] [--node-id NAME]
                [--advertise-host IP] [--tcp-port P] [--simulate-latency-ms MS]
                [--encrypt-passphrase PASS] [--threads N] [--workdir DIR]
 python -m coordinator.server          # env: PORT / POOLFORGE_PORT, POOLFORGE_DB_PATH, ... (.env.example)
