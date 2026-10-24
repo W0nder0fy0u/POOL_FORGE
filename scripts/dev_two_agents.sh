@@ -5,7 +5,9 @@
 #   bash scripts/dev_two_agents.sh --train    # ...and start a training job via one API call
 #
 # Agent A pretends to have 1 GB free RAM, agent B 2 GB (--ram-cap-gb), so the
-# scheduler gives B about twice as many layers. Press Ctrl+C to stop everything.
+# scheduler gives B about twice as many layers. If this machine has a GPU,
+# agent A trains on it (sized by free VRAM) and B stays on the CPU, so you see
+# a mixed GPU + CPU pool. Press Ctrl+C to stop everything.
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
@@ -32,7 +34,7 @@ TOKEN=$("$PY" -c 'import json,sys; print(json.load(sys.stdin)["admin_token"])' <
 echo "== Starting agent laptop-a (1 GB cap) and laptop-b (2 GB cap) (logs: run/agent-*.log)"
 "$PY" -m agent.cli join "$CODE" --server "$URL" --node-id laptop-a --ram-cap-gb 1 --workdir run/a > run/agent-a.log 2>&1 &
 pids+=($!)
-"$PY" -m agent.cli join "$CODE" --server "$URL" --node-id laptop-b --ram-cap-gb 2 --workdir run/b > run/agent-b.log 2>&1 &
+"$PY" -m agent.cli join "$CODE" --server "$URL" --node-id laptop-b --ram-cap-gb 2 --device cpu --workdir run/b > run/agent-b.log 2>&1 &
 pids+=($!)
 sleep 4
 

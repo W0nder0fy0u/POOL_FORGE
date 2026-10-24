@@ -25,7 +25,18 @@ laptops can reach each other (same Wi-Fi, hotspot or Tailscale).
 states and one activation per layer. It does not count the PyTorch runtime (several
 hundred MB per process), temporary buffers, or the dataset on the first stage. The
 scheduler keeps 10% headroom, but a node can still run out of memory.
-`--ram-cap-gb` only changes what the agent *reports*; it does not enforce a limit.
+`--ram-cap-gb` / `--vram-cap-gb` only change what the agent *reports*; they do not enforce a limit.
+
+**GPU sharing does not merge VRAM.** Each GPU holds only its own layers; activations
+still travel over the network every step. A GPU makes its stage much faster, but a
+slow network or a CPU-only stage can still be the bottleneck. The CUDA context also
+uses a few hundred MB of VRAM that the estimate does not count.
+
+**Voice calls are peer to peer (mesh).** Every person sends audio to every other
+person, which is fine for about 6 people. Browsers only allow the microphone on
+https:// or http://localhost, so on a LAN use the Render URL (or localhost) for calls.
+Without a TURN server, calls can fail on strict networks (college Wi-Fi, mobile data).
+Chat history is kept in memory (last 100 messages) and is lost on restart.
 
 **Trust model.**
 - Anyone with the room code can join until the admin locks the room. A malicious
@@ -51,11 +62,15 @@ interactive programs do not.
 - Only one job per room at a time; one stage per node.
 
 **Scale and scope.**
-- CPU training only; no GPU scheduling.
+- One stage per GPU: a laptop with two GPUs only uses the first one.
 - The model zoo is small: MLPs and CNNs made of linear/conv/pool/activation layers.
   No transformers, skip connections or branching models.
 - Hosting: only the allow-listed sample apps and images. Docker apps were not tested on
   the development machine (no Docker there); only the "Docker missing" path is covered
   by tests. Cloudflare quick tunnels are for demos (no uptime guarantee).
-- Tested on Linux. Windows support relies on cross-platform Python and PowerShell
-  scripts, but has not been run on a Windows machine during development.
+- Developed on Linux. Windows is checked by CI: `.github/workflows/tests.yml` runs the
+  full test suite on Windows and Linux on every push, including the friend install flow
+  (fresh venv, `pip install` from the server, run `poolforge`). Those CI machines have no
+  GPU, so GPU training was tested on Linux (NVIDIA) only; on Windows it uses the same
+  PyTorch CUDA calls. Windows users with an NVIDIA GPU must install the CUDA build of
+  PyTorch (the Join page has a checkbox for this); plain `pip install torch` on Windows is CPU-only.

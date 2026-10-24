@@ -1,8 +1,12 @@
 // Live room state: one WebSocket to /ws/dashboard/{code} feeds every page.
 //
 // The coordinator first sends a "snapshot" (everything so far), then small
-// events: node, job, step, node_step, deployment, locked. This file folds
-// them into one state object with a reducer.
+// events: node, job, step, node_step, deployment, locked, chat, call. This
+// file folds them into one state object with a reducer.
+//
+// The same socket carries chat messages and voice-call signalling. The
+// coordinator gives this tab a peer id ("hello"); "signal" events (WebRTC
+// offers/answers) go straight to the call code in call.js, not into state.
 
 import { createContext, useContext, useEffect, useReducer, useRef, useState } from "react";
 import { api, getAdminToken, setAdminToken, wsUrl } from "./api.js";
@@ -19,6 +23,9 @@ const initial = {
   deployments: {},
   locked: false,
   log: [],
+  chat: [], // last 100 chat messages of the room
+  call: [], // [{peer_id, name}] everyone in the voice call
+  myPeerId: null, // this tab's id for chat / call
 };
 
 function addLog(state, text) {
@@ -49,6 +56,9 @@ function reducer(state, ev) {
         deployments,
         locked: ev.locked,
         log: state.log,
+        chat: ev.chat || [],
+        call: ev.call || [],
+        myPeerId: state.myPeerId,
       };
     }
     case "node":
@@ -82,6 +92,12 @@ function reducer(state, ev) {
       return { ...state, locked: ev.locked };
     case "log":
       return { ...state, log: addLog(state, ev.text) };
+    case "hello":
+      return { ...state, myPeerId: ev.peer_id };
+    case "chat":
+      return { ...state, chat: [...state.chat, ev].slice(-100) };
+    case "call":
+      return { ...state, call: ev.call };
     default:
       return state;
   }
@@ -93,6 +109,7 @@ export function RoomProvider({ code, children }) {
   const [token, setToken] = useState(() => getAdminToken(code));
   const [isAdmin, setIsAdmin] = useState(false);
   const wsRef = useRef(null);
+  const signalHandler = useRef(null); // set by useCall()
 
   // Accept "#admin=TOKEN" in the URL once (used by the dev scripts), then hide it.
   useEffect(() => {
@@ -128,11 +145,14 @@ export function RoomProvider({ code, children }) {
         ping = setInterval(() => ws.readyState === 1 && ws.send("ping"), 20000);
       };
       ws.onmessage = (e) => {
+        let ev;
         try {
-          dispatch(JSON.parse(e.data));
+          ev = JSON.parse(e.data);
         } catch {
-          /* ignore malformed event */
+          return; // ignore malformed event
         }
+        if (ev.type === "signal") signalHandler.current?.(ev.from, ev.data);
+        else dispatch(ev);
       };
       ws.onclose = (e) => {
         clearInterval(ping);
@@ -167,7 +187,13 @@ export function RoomProvider({ code, children }) {
     }
   };
 
-  const value = { code, state, conn, token, isAdmin, saveToken, admin, log };
+  // Chat / call messages to the coordinator (dropped while disconnected).
+  const send = (obj) => {
+    const ws = wsRef.current;
+    if (ws && ws.readyState === 1) ws.send(JSON.stringify(obj));
+  };
+
+  const value = { code, state, conn, token, isAdmin, saveToken, admin, log, send, signalHandler };
   return <RoomContext.Provider value={value}>{children}</RoomContext.Provider>;
 }
 

@@ -20,6 +20,11 @@ The "autograd trick": `detach()` cuts the graph at the network boundary and
 backward() the receiver's `inp.grad` is exactly dLoss/d(activation), which is
 what the previous stage needs to continue backprop with out.backward(grad).
 
+GPU: each stage keeps its layers on its own device ("cuda", "mps" or "cpu").
+Tensors always travel the network as CPU bytes (serialize_tensor calls
+.cpu()), and every received tensor is moved to this stage's device, so a GPU
+laptop and a CPU-only laptop can be in the same pipeline.
+
 With M > 1, stage 0 can start micro-batch 1 while stage 1 still works on
 micro-batch 0, which hides some network latency (when stages run on
 different machines/processes).
@@ -111,7 +116,9 @@ class PipelineStage:
         encrypt_key: Optional[bytes] = None,
         checkpoint_dir: str = "./checkpoints",
         attempt: int = 0,
+        device: str = "cpu",
     ):
+        self.device = torch.device(device)
         self.stage_index = stage_index
         self.num_stages = num_stages
         self.is_first = stage_index == 0
@@ -128,7 +135,8 @@ class PipelineStage:
         self.checkpoint_dir = Path(checkpoint_dir) / job_id
 
         # Build ONLY this stage's layers. The full model never exists on one node.
-        self.layers: nn.Sequential = build_layers(specs, start_layer, end_layer, seed=seed)
+        # Moved to the GPU (if any) BEFORE the optimizer is made, so it tracks the GPU weights.
+        self.layers: nn.Sequential = build_layers(specs, start_layer, end_layer, seed=seed).to(self.device)
         self.optimizer = make_optimizer(self.layers.parameters(), optimizer, lr)
         self.loss_fn = nn.CrossEntropyLoss()
 
@@ -158,8 +166,9 @@ class PipelineStage:
         if self.optimizer:
             self.optimizer.zero_grad()
 
-        xs = torch.chunk(x, microbatches) if self.is_first else [None] * microbatches
-        ys = torch.chunk(y, microbatches) if self.is_first else [None] * microbatches
+        dev = self.device
+        xs = torch.chunk(x.to(dev), microbatches) if self.is_first else [None] * microbatches
+        ys = torch.chunk(y.to(dev), microbatches) if self.is_first else [None] * microbatches
         if self.is_first and len(xs) != microbatches:
             raise ValueError("batch_size must be >= microbatches")
 
@@ -172,10 +181,10 @@ class PipelineStage:
                 inp, labels = None, ys[m]
                 out = await run(self.layers, xs[m])
             else:
-                inp = (await self.mailbox.get("activation", step, m)).requires_grad_()
+                inp = (await self.mailbox.get("activation", step, m)).to(dev).requires_grad_()
                 if m == 0:
                     self.first_input_time = time.perf_counter()
-                labels = await self.mailbox.get("labels", step, m)
+                labels = (await self.mailbox.get("labels", step, m)).to(dev)
                 out = await run(self.layers, inp)
 
             if self.is_last:
@@ -196,7 +205,7 @@ class PipelineStage:
         # ------- backward pass for every micro-batch (non-last stages) -------
         for m in range(len(saved)):
             inp, out = saved[m]
-            grad = await self.mailbox.get("gradient", step, m)
+            grad = (await self.mailbox.get("gradient", step, m)).to(dev)
             if out.requires_grad:  # False only for a first stage with no weights
                 await run(out.backward, grad)
             if not self.is_first:
@@ -235,7 +244,7 @@ class PipelineStage:
         if not path.exists():
             return False
         # weights_only=True: only tensors/numbers are loaded, never arbitrary objects.
-        state = torch.load(path, map_location="cpu", weights_only=True)
+        state = torch.load(path, map_location=self.device, weights_only=True)
         if list(state["layers"]) != [self.start_layer, self.end_layer]:
             return False
         self.layers.load_state_dict(state["model"])
@@ -286,8 +295,11 @@ async def train_split_locally(
     optimizer: str = "adam",
     seed: int = 0,
     latency_ms: float = 0.0,
+    devices: Optional[List[str]] = None,
 ) -> Tuple[List[float], float]:
     """Run an N-stage pipeline inside one process over LocalTransport.
+
+    `devices` (optional) puts stage i on devices[i], e.g. ["cuda", "cpu"].
 
     Returns (losses, seconds). Used by the loss-equivalence test.
     """
@@ -304,6 +316,7 @@ async def train_split_locally(
                 prev_node=ids[i - 1] if i > 0 else None,
                 next_node=ids[i + 1] if i < n - 1 else None,
                 job_id="local", lr=lr, optimizer=optimizer, seed=seed,
+                device=devices[i] if devices else "cpu",
             )
         )
     losses = []

@@ -16,7 +16,8 @@ The image is ~165 MB (no PyTorch: the coordinator never trains). Podman works th
 (`podman build` / `podman run`); with rootless podman use `http://127.0.0.1:8000`.
 
 Optional environment variables: `POOLFORGE_PUBLIC_URL` (URL printed in join commands),
-`POOLFORGE_REPO_URL` (git URL shown on the Join page), `POOLFORGE_DROP_GRACE_S`.
+`POOLFORGE_DROP_GRACE_S`, and `POOLFORGE_TURN_URL` / `_USER` / `_PASS` (TURN relay for
+voice calls on strict networks; without it calls use free Google STUN only).
 See `.env.example`.
 
 ## Option 2: Render (free, public HTTPS URL)
@@ -31,10 +32,14 @@ Pick ONE of these ways.
    - **Build Command**: `pip install -r requirements-coordinator.txt`
    - **Start Command**: `python -m coordinator.server`
    - **Instance Type**: Free
-   - **Environment**: `PYTHON_VERSION` = `3.12.8`, optionally `POOLFORGE_REPO_URL` = your GitHub URL
+   - **Environment**: `PYTHON_VERSION` = `3.12.8`
    - **Health Check Path** (Advanced): `/health`
    (Or **New -> Blueprint**: `render.yaml` in the repo root has exactly these settings.)
 3. Open `https://<name>.onrender.com/health` -> `{"status":"ok"}`.
+
+Friends do not need access to the GitHub repo (it can stay private): the Join page tells
+them to run `pip install https://<name>.onrender.com/download/poolforge.tar.gz`, which
+downloads the agent straight from your coordinator.
 
 The dashboard is pre-built in `dashboard/dist`, so no Node.js step is needed. If you
 change the dashboard, run `cd dashboard && npm run build` and commit `dist/`.
@@ -43,7 +48,7 @@ change the dashboard, run `cd dashboard && npm run build` and commit `dist/`.
 
 1. Push the repo to GitHub.
 2. Render dashboard -> **New -> Web Service** -> pick the repo -> **Language: Docker**
-   (it builds the `Dockerfile` in the repo root). Set `POOLFORGE_REPO_URL` to your GitHub URL.
+   (it builds the `Dockerfile` in the repo root).
 3. Wait for the build, then open `https://<name>.onrender.com/health` -> `{"status":"ok"}`.
 
 ### 2b. Docker: you build the image, Render just runs it
@@ -57,7 +62,6 @@ change the dashboard, run `cd dashboard && npm run build` and commit `dist/`.
 3. Render dashboard -> **New -> Web Service -> Existing Image** -> paste that image URL.
    - Instance type: **Free**
    - Health check path: `/health` (Settings -> Health Checks)
-   - Environment: optional `POOLFORGE_REPO_URL` = your GitHub URL
    Render sets `PORT` itself; the coordinator listens on it automatically.
 4. To update later: run the publish script again, then on Render click
    **Manual Deploy -> Deploy latest reference**.

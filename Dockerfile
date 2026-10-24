@@ -25,7 +25,10 @@ WORKDIR /app
 COPY requirements-coordinator.txt .
 RUN pip install --no-cache-dir -r requirements-coordinator.txt
 
-# Only what the coordinator needs (no agent/, no torch).
+# Coordinator code (no torch). agent/ + pyproject.toml are copied only so the
+# server can hand them out at /download/poolforge.tar.gz (they are not run here).
+COPY pyproject.toml README.md ./
+COPY agent/ agent/
 COPY common/ common/
 COPY coordinator/ coordinator/
 COPY --from=dashboard /build/dist dashboard/dist

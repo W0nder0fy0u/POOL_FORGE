@@ -24,6 +24,9 @@ def build_parser() -> argparse.ArgumentParser:
     j.add_argument("--server", default=os.environ.get("POOLFORGE_SERVER", "http://localhost:8000"), help="coordinator URL")
     j.add_argument("--ram-cap-gb", type=float, default=None,
                    help="report at most this much free RAM (simulate a small laptop)")
+    j.add_argument("--device", choices=["auto", "cpu", "cuda", "mps"], default=os.environ.get("POOLFORGE_DEVICE", "auto"),
+                   help="train on the GPU if there is one (auto, default), or force cpu / cuda / mps")
+    j.add_argument("--vram-cap-gb", type=float, default=None, help="share at most this much GPU memory")
     j.add_argument("--transport", choices=["relay", "tcp"], default=os.environ.get("POOLFORGE_TRANSPORT", "relay"),
                    help="relay (default, works anywhere) or tcp (direct, LAN/Tailscale only)")
     j.add_argument("--advertise-host", default=None, help="IP other nodes use to reach this one (tcp; default: auto)")
@@ -78,13 +81,18 @@ def main(argv=None) -> int:
 
     from agent.worker import Agent, JoinError
 
-    agent = Agent(
-        room=args.room, server=args.server, node_id=args.node_id, ram_cap_gb=args.ram_cap_gb,
-        transport=args.transport, advertise_host=args.advertise_host, tcp_port=args.tcp_port,
-        simulate_latency_ms=args.simulate_latency_ms, encrypt_passphrase=args.encrypt_passphrase,
-        workdir=args.workdir,
-    )
+    try:
+        agent = Agent(
+            room=args.room, server=args.server, node_id=args.node_id, ram_cap_gb=args.ram_cap_gb,
+            transport=args.transport, advertise_host=args.advertise_host, tcp_port=args.tcp_port,
+            simulate_latency_ms=args.simulate_latency_ms, encrypt_passphrase=args.encrypt_passphrase,
+            workdir=args.workdir, device=args.device, vram_cap_gb=args.vram_cap_gb,
+        )
+    except RuntimeError as exc:  # e.g. --device cuda without a CUDA GPU
+        print(f"Error: {exc}", file=sys.stderr)
+        return 2
     print(f"PoolForge agent {__version__}: joining room {args.room.upper()} at {args.server}")
+    print(f"  training device: {agent.device}" + (f" (sharing at most {args.vram_cap_gb} GB VRAM)" if args.vram_cap_gb else ""))
     if args.ram_cap_gb:
         print(f"  reporting at most {args.ram_cap_gb} GB free RAM (--ram-cap-gb)")
     print("  press Ctrl+C to leave the pool")

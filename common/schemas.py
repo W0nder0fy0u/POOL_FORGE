@@ -74,6 +74,12 @@ class StatsMsg(Strict):
     tcp_port: Optional[int] = Field(default=None, ge=1, le=65535)
     docker: bool = False
     cloudflared: bool = False
+    # GPU sharing (optional, so older agents still validate)
+    device: Literal["cpu", "cuda", "mps"] = "cpu"
+    gpu_name: Optional[str] = Field(default=None, max_length=100)
+    vram_total_gb: Optional[float] = Field(default=None, ge=0)
+    vram_free_gb: Optional[float] = Field(default=None, ge=0)  # already min(real free, --vram-cap-gb)
+    vram_cap_gb: Optional[float] = Field(default=None, ge=0)
 
 
 class StepMsg(Strict):
@@ -88,6 +94,7 @@ class StepMsg(Strict):
     bytes_received: int = Field(ge=0)
     avg_send_ms: float = Field(ge=0)
     proc_ram_mb: float = Field(ge=0)
+    gpu_mem_mb: Optional[float] = Field(default=None, ge=0)  # peak VRAM used by this stage (GPU nodes only)
 
 
 class CheckpointMsg(Strict):
@@ -148,6 +155,7 @@ class AssignMsg(Strict):
     peers: Dict[str, List[Any]] = Field(default_factory=dict)  # node_id -> [host, port] (tcp only)
     hp: HyperParams
     resume_step: int = 0  # >0: load this checkpoint first, then continue
+    device: Literal["cpu", "cuda", "mps"] = "cpu"  # where the planner wants this stage to run
     attempt: int = 0  # bumped on every re-assign, so stale frames of older attempts are ignored
 
 
@@ -171,3 +179,34 @@ class StopAppMsg(Strict):
 
 CoordinatorMessage = Annotated[Union[AssignMsg, ControlMsg, RunAppMsg, StopAppMsg], Field(discriminator="type")]
 coordinator_message_adapter = TypeAdapter(CoordinatorMessage)
+
+
+# ------------------------------------------- browser -> coordinator (WS)
+# Chat and voice-call signalling from the dashboard. Audio itself goes browser
+# to browser (WebRTC); the coordinator only forwards these small messages.
+PEER_ID_PATTERN = r"^[0-9a-f]{8}$"
+
+
+class ChatIn(Strict):
+    type: Literal["chat"]
+    name: str = Field(min_length=1, max_length=30)
+    text: str = Field(min_length=1, max_length=500)
+
+
+class CallJoin(Strict):
+    type: Literal["call_join"]
+    name: str = Field(min_length=1, max_length=30)
+
+
+class CallLeave(Strict):
+    type: Literal["call_leave"]
+
+
+class Signal(Strict):
+    type: Literal["signal"]
+    to: str = Field(pattern=PEER_ID_PATTERN)
+    data: Dict[str, Any]  # WebRTC offer / answer / ICE candidate, passed through as-is
+
+
+BrowserMessage = Annotated[Union[ChatIn, CallJoin, CallLeave, Signal], Field(discriminator="type")]
+browser_message_adapter = TypeAdapter(BrowserMessage)

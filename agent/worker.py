@@ -28,6 +28,7 @@ from typing import Any, Deque, Dict, Optional
 import psutil
 import websockets
 
+from agent.gpu import gpu_stats, pick_device
 from agent.hosting import AppManager, lan_ip
 from agent.trainer import proc_ram_mb, run_job
 from common.schemas import AssignMsg, ControlMsg, RunAppMsg, StatsMsg, StopAppMsg, coordinator_message_adapter
@@ -54,6 +55,8 @@ class Agent:
         simulate_latency_ms: float = 0.0,
         encrypt_passphrase: Optional[str] = None,
         workdir: str = ".",
+        device: str = "auto",
+        vram_cap_gb: Optional[float] = None,
     ):
         self.room = room.strip().upper()
         self.server = server.rstrip("/")
@@ -64,6 +67,8 @@ class Agent:
         self.tcp_port = tcp_port
         self.latency = simulate_latency_ms
         self.workdir = Path(workdir)
+        self.device = pick_device(device)  # "cuda", "mps" or "cpu"
+        self.vram_cap_gb = vram_cap_gb
         self.key = None
         if encrypt_passphrase:
             from common.crypto import derive_room_key
@@ -135,6 +140,7 @@ class Agent:
             transport=self.transport_mode, tcp_host=(self.advertise_host or lan_ip()) if self.tcp else None,
             tcp_port=self.tcp.port if self.tcp else None,
             docker=self.apps.has_docker, cloudflared=self.apps.has_cloudflared,
+            device=self.device, **gpu_stats(self.device, self.vram_cap_gb),
         )
 
     async def report(self, msg: Any) -> None:
@@ -251,9 +257,11 @@ class Agent:
         self.job_id = msg.job_id
         self.gate.set()
         transport = self._transport_for(msg)
+        # Use our GPU only if the planner counted it (it sized our layers by VRAM).
+        device = self.device if msg.device == self.device else "cpu"
         self.job_task = asyncio.create_task(
             run_job(msg, transport, self.report, self.gate, self.key,
-                    str(self.workdir / "checkpoints"), str(self.workdir / "data"))
+                    str(self.workdir / "checkpoints"), str(self.workdir / "data"), device)
         )
 
     async def shutdown(self) -> None:

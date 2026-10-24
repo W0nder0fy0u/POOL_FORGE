@@ -36,10 +36,43 @@ def test_coordinator_requirements_have_no_torch():
     assert not any(l.startswith("torch") for l in lines) and any(l.startswith("fastapi") for l in lines)
 
 
-def test_dockerfile_copies_only_coordinator_side():
+def test_dockerfile_installs_coordinator_deps_only():
+    # agent/ is copied only so the server can hand it out; torch is never installed.
     text = (ROOT / "Dockerfile").read_text()
-    assert "COPY coordinator/" in text and "COPY common/" in text
-    assert "COPY agent/" not in text and "requirements-coordinator.txt" in text
+    assert "COPY coordinator/" in text and "COPY common/" in text and "COPY agent/" in text
+    assert "requirements-coordinator.txt" in text
+
+
+def test_source_tarball_is_pip_installable_layout():
+    import io
+    import tarfile
+
+    from coordinator.server import build_source_tarball
+
+    names = tarfile.open(fileobj=io.BytesIO(build_source_tarball())).getnames()
+    assert "poolforge/pyproject.toml" in names and "poolforge/agent/cli.py" in names
+    assert not any("__pycache__" in n for n in names)
+    assert not any("\\" in n for n in names)  # forward slashes even on a Windows coordinator
+
+
+def test_friend_install_flow_in_fresh_venv(tmp_path):
+    """What the Join page tells friends: make a venv, pip install the server's tarball,
+    run `poolforge` by its path (Scripts\\ on Windows, bin/ elsewhere)."""
+    import os
+    import subprocess
+    import venv
+
+    from coordinator.server import build_source_tarball
+
+    tar = tmp_path / "poolforge.tar.gz"
+    tar.write_bytes(build_source_tarball())
+    env_dir = tmp_path / "poolforge-env"
+    venv.create(env_dir, with_pip=True)
+    bin_dir = env_dir / ("Scripts" if os.name == "nt" else "bin")
+    # --no-deps: torch etc. are huge; this checks the package and its entry point only.
+    subprocess.run([str(bin_dir / "python"), "-m", "pip", "install", "-q", "--no-deps", str(tar)], check=True)
+    out = subprocess.run([str(bin_dir / "poolforge"), "--help"], capture_output=True, text=True, check=True).stdout
+    assert "join" in out
 
 
 def test_cli_entry_point_and_version(capsys):

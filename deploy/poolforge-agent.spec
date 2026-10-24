@@ -28,7 +28,7 @@ a = Analysis(
     [os.path.join(root, "agent", "cli.py")],
     pathex=[root],
     datas=[(os.path.join(root, "deploy", "sample_apps"), os.path.join("deploy", "sample_apps"))],
-    hiddenimports=["agent.worker", "agent.trainer", "agent.hosting", "common.crypto", "websockets.asyncio.client"],
+    hiddenimports=["agent.worker", "agent.trainer", "agent.hosting", "agent.gpu", "common.crypto", "websockets.asyncio.client"],
     excludes=["coordinator", "fastapi", "uvicorn", "matplotlib", "tkinter", "pytest"],
     noarchive=False,
 )

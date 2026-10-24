@@ -63,7 +63,8 @@ CREATE TABLE IF NOT EXISTS node_metrics (
     bytes_received INTEGER NOT NULL,
     avg_send_ms REAL NOT NULL,
     proc_ram_mb REAL NOT NULL,
-    t REAL NOT NULL
+    t REAL NOT NULL,
+    gpu_mem_mb REAL
 );
 CREATE TABLE IF NOT EXISTS deployments (
     id TEXT PRIMARY KEY,
@@ -95,6 +96,10 @@ class DB:
         if path != ":memory:":
             self.conn.execute("PRAGMA journal_mode=WAL")
         self.conn.executescript(SCHEMA)
+        # Databases made before GPU support lack this column: add it once.
+        cols = [r["name"] for r in self.conn.execute("PRAGMA table_info(node_metrics)")]
+        if "gpu_mem_mb" not in cols:
+            self.conn.execute("ALTER TABLE node_metrics ADD COLUMN gpu_mem_mb REAL")
         self.lock = threading.Lock()
         # Jobs that were running when the coordinator stopped can't continue.
         self.execute(
@@ -172,9 +177,9 @@ class DB:
 
     def add_node_metric(self, job_id: str, node_id: str, m: Any) -> None:
         self.execute(
-            "INSERT INTO node_metrics VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            "INSERT INTO node_metrics VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (job_id, node_id, m.stage, m.step, m.step_time_ms, m.bytes_sent, m.bytes_received,
-             m.avg_send_ms, m.proc_ram_mb, time.time()),
+             m.avg_send_ms, m.proc_ram_mb, time.time(), m.gpu_mem_mb),
         )
 
     def job_metrics(self, job_id: str) -> List[Dict[str, Any]]:
@@ -182,7 +187,7 @@ class DB:
 
     def job_node_metrics(self, job_id: str) -> List[Dict[str, Any]]:
         return self.query(
-            "SELECT node_id, stage, step, step_time_ms, bytes_sent, bytes_received, avg_send_ms, proc_ram_mb, t "
+            "SELECT node_id, stage, step, step_time_ms, bytes_sent, bytes_received, avg_send_ms, proc_ram_mb, gpu_mem_mb, t "
             "FROM node_metrics WHERE job_id=? ORDER BY step, stage",
             (job_id,),
         )

@@ -8,6 +8,8 @@ export default function Nodes() {
   const online = nodes.filter((n) => n.online);
   const freeGb = online.reduce((s, n) => s + (n.ram_free_gb || 0), 0);
   const totalGb = online.reduce((s, n) => s + (n.ram_total_gb || 0), 0);
+  const gpus = online.filter((n) => n.device === "cuda");
+  const vramGb = gpus.reduce((s, n) => s + (n.vram_free_gb || 0), 0);
   const joinCmd = `poolforge join ${code} --server ${window.location.origin}`;
 
   return (
@@ -16,6 +18,7 @@ export default function Nodes() {
         <Stat label="Nodes online" value={online.length} sub={`${nodes.length} joined in total`} />
         <Stat label="Pool free RAM (reported)" value={`${fmtNum(freeGb, 1)} GB`} sub="after --ram-cap-gb limits" />
         <Stat label="Pool total RAM" value={`${fmtNum(totalGb, 1)} GB`} />
+        <Stat label="Pool free VRAM" value={`${fmtNum(vramGb, 1)} GB`} sub={`${gpus.length} GPU node${gpus.length === 1 ? "" : "s"}`} />
         <Stat label="Room" value={state.locked ? "Locked" : "Open"} sub={state.locked ? "no new nodes can join" : "anyone with the code can join"} />
       </div>
 
@@ -69,12 +72,24 @@ function NodeCard({ node, color }) {
             text={`${fmtNum(node.ram_free_gb, 2)} / ${fmtNum(node.ram_cap_gb || node.ram_total_gb, 1)} GB`}
             color="var(--accent)"
           />
+          {node.device === "cuda" && node.vram_total_gb !== undefined && (
+            <Meter
+              label={node.vram_cap_gb ? `VRAM free (capped at ${node.vram_cap_gb} GB)` : "VRAM free"}
+              value={node.vram_free_gb}
+              max={node.vram_cap_gb || node.vram_total_gb}
+              text={`${fmtNum(node.vram_free_gb, 2)} / ${fmtNum(node.vram_cap_gb || node.vram_total_gb, 1)} GB`}
+              color="var(--good)"
+            />
+          )}
           <Meter label="CPU" value={node.cpu_percent} max={100} text={`${fmtNum(node.cpu_percent, 0)} %`} color="var(--accent-2)" />
           <div className="row small secondary" style={{ marginTop: "0.6rem" }}>
             <span>Agent RAM: {fmtNum(node.proc_ram_mb, 0)} MB</span>
             <span>Machine used: {fmtNum(usedGb, 1)} GB</span>
           </div>
           <div className="row" style={{ marginTop: "0.5rem" }}>
+            <span className="pill" title="Where this node trains">
+              {node.gpu_name ? `GPU: ${node.gpu_name}` : "CPU only"}
+            </span>
             <span className="pill">transport: {node.transport}</span>
             <span className="pill">{node.docker ? "docker ok" : "no docker"}</span>
             <span className="pill">{node.cloudflared ? "cloudflared ok" : "no cloudflared"}</span>

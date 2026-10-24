@@ -29,7 +29,18 @@ from dataclasses import dataclass, field
 from typing import Any, Deque, Dict, List, Optional, Set, Tuple
 
 from common.model_zoo import get_model
-from common.schemas import AssignMsg, ControlMsg, HyperParams, JobStateMsg, StepMsg, TrainingConfig
+from common.schemas import (
+    AssignMsg,
+    CallJoin,
+    CallLeave,
+    ChatIn,
+    ControlMsg,
+    HyperParams,
+    JobStateMsg,
+    Signal,
+    StepMsg,
+    TrainingConfig,
+)
 from common.specs import validate_specs
 from coordinator.db import DB
 from coordinator.scheduler import NodeCapacity, plan_split
@@ -67,6 +78,14 @@ class NodeLive:
             "last_seen": self.last_seen,
             **{k: v for k, v in self.stats.items() if k not in ("type", "hostname", "os")},
         }
+
+
+def node_capacity(n: NodeLive) -> NodeCapacity:
+    """What the planner may use on this node: its GPU's free VRAM, or else its free RAM."""
+    if n.stats.get("device") == "cuda" and n.stats.get("vram_free_gb"):
+        return NodeCapacity(n.node_id, float(n.stats["vram_free_gb"]), "cuda")
+    device = "mps" if n.stats.get("device") == "mps" else "cpu"  # Apple GPUs share RAM
+    return NodeCapacity(n.node_id, float(n.stats["ram_free_gb"]), device)
 
 
 @dataclass
@@ -119,6 +138,10 @@ class Room:
     job: Optional[JobLive] = None
     # Frames for a node whose relay is (briefly) disconnected: node_id -> deque[(time, bytes)]
     pending: Dict[str, Deque[Tuple[float, bytes]]] = field(default_factory=dict)
+    # Chat + voice call (in memory only; gone when the coordinator restarts)
+    peers: Dict[str, Any] = field(default_factory=dict)  # peer_id -> dashboard WebSocket
+    chat: Deque[Dict[str, Any]] = field(default_factory=lambda: deque(maxlen=100))
+    call: Dict[str, str] = field(default_factory=dict)  # peer_id -> name of everyone in the call
 
 
 class RateLimiter:
@@ -193,8 +216,40 @@ class Hub:
             "metrics": self.db.job_metrics(job.job_id) if job else [],
             "node_metrics": self.db.job_node_metrics(job.job_id)[-2000:] if job else [],
             "deployments": self.db.list_deployments(room.code),
+            "chat": list(room.chat),
+            "call": self.call_list(room),
         }
         return data
+
+    # ------------------------------------------------------ chat + call
+    @staticmethod
+    def call_list(room: Room) -> List[Dict[str, str]]:
+        return [{"peer_id": pid, "name": name} for pid, name in room.call.items()]
+
+    async def on_browser(self, room: Room, peer_id: str, msg: Any) -> None:
+        """Chat and voice-call messages from one dashboard (already validated)."""
+        if isinstance(msg, ChatIn):
+            entry = {"name": msg.name, "text": msg.text, "t": time.time(), "peer_id": peer_id}
+            room.chat.append(entry)
+            await self.broadcast(room, {"type": "chat", **entry})
+        elif isinstance(msg, CallJoin):
+            room.call[peer_id] = msg.name
+            await self.broadcast(room, {"type": "call", "call": self.call_list(room)})
+        elif isinstance(msg, CallLeave):
+            await self.leave_call(room, peer_id)
+        elif isinstance(msg, Signal):
+            # Only forward between two peers that are both in THIS room's call.
+            target = room.peers.get(msg.to)
+            if target is None or peer_id not in room.call or msg.to not in room.call:
+                return
+            try:
+                await target.send_text(json.dumps({"type": "signal", "from": peer_id, "data": msg.data}))
+            except Exception:
+                pass
+
+    async def leave_call(self, room: Room, peer_id: str) -> None:
+        if room.call.pop(peer_id, None) is not None:
+            await self.broadcast(room, {"type": "call", "call": self.call_list(room)})
 
     # ------------------------------------------------------- node presence
     async def node_online(self, room: Room, node: NodeLive) -> None:
@@ -270,7 +325,7 @@ class Hub:
         if dataset == "mnist" and model["input_shape"] != [1, 28, 28]:
             raise ApiError(400, f"Model '{cfg.model}' does not take MNIST images")
         nodes = [n for n in room.nodes.values() if n.ws is not None and n.stats]
-        caps = [NodeCapacity(n.node_id, float(n.stats["ram_free_gb"])) for n in nodes]
+        caps = [node_capacity(n) for n in nodes]
         try:
             plan = [p.to_dict() for p in plan_split(model["specs"], model["input_shape"], caps, cfg.batch_size)]
         except ValueError as exc:
@@ -312,6 +367,7 @@ class Hub:
                 prev_node=job.plan[i - 1]["node_id"] if i > 0 else None,
                 next_node=job.plan[i + 1]["node_id"] if i < n - 1 else None,
                 transport=job.transport, peers=peers, hp=hp, resume_step=resume_step, attempt=job.attempt,
+                device=p.get("device", "cpu"),
             )
             await self.send(room.nodes[p["node_id"]], msg)
 

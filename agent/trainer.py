@@ -12,6 +12,7 @@ from typing import Awaitable, Callable, Optional
 
 import psutil
 
+from agent.gpu import peak_gpu_mb
 from common.datasets import get_batches
 from common.pipeline import PipelineStage
 from common.schemas import AssignMsg, CheckpointMsg, JobStateMsg, StepMsg
@@ -35,6 +36,7 @@ async def run_job(
     encrypt_key: Optional[bytes] = None,
     checkpoint_dir: str = "./checkpoints",
     data_dir: str = "./data",
+    device: str = "cpu",
 ) -> None:
     """Train this node's stage until all steps are done (or we are cancelled).
 
@@ -48,6 +50,7 @@ async def run_job(
             assign.specs, assign.start_layer, assign.end_layer, i, assign.num_stages, transport,
             assign.prev_node, assign.next_node, assign.job_id, lr=hp.lr, optimizer=hp.optimizer,
             seed=hp.seed, encrypt_key=encrypt_key, checkpoint_dir=checkpoint_dir, attempt=assign.attempt,
+            device=device,
         )
         start = 0
         if assign.resume_step > 0:
@@ -65,9 +68,9 @@ async def run_job(
             for _ in range(start):  # skip batches already trained on, to stay deterministic
                 next(batches)
         logger.info(
-            "Job %s: stage %d/%d, layers [%d, %d), %s params%s",
+            "Job %s: stage %d/%d, layers [%d, %d), %s params on %s%s",
             assign.job_id, i + 1, assign.num_stages, assign.start_layer, assign.end_layer,
-            f"{stage.num_params():,}", f", data: {detail}" if detail else "",
+            f"{stage.num_params():,}", device, f", data: {detail}" if detail else "",
         )
         await report(JobStateMsg(type="job_state", job_id=assign.job_id, stage=i, state="started", detail=detail))
         transport.take_step_stats()  # reset counters
@@ -92,7 +95,7 @@ async def run_job(
             await report(StepMsg(
                 type="step", job_id=assign.job_id, stage=i, step=step + 1, epoch=step // hp.steps_per_epoch + 1,
                 loss=loss, step_time_ms=step_ms, bytes_sent=net["bytes_sent"], bytes_received=net["bytes_received"],
-                avg_send_ms=net["avg_send_ms"], proc_ram_mb=proc_ram_mb(),
+                avg_send_ms=net["avg_send_ms"], proc_ram_mb=proc_ram_mb(), gpu_mem_mb=peak_gpu_mb(device),
             ))
             if loss is not None and (step + 1) % 10 == 0:
                 logger.info("step %d/%d  loss %.4f  %.0f ms/step", step + 1, total, loss, step_ms)

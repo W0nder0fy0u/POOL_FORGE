@@ -96,8 +96,11 @@ schedule).
 
 1. `specs.estimate_memory`: for each layer, `params x 4 bytes x 4` (weights, grads,
    2 Adam states) plus `activation elements x batch x 4 bytes`.
-2. Nodes are sorted by reported free RAM (`min(real free, --ram-cap-gb)`), and 90% of
-   that is usable.
+2. Nodes are sorted by reported free memory, and 90% of that is usable. For a node
+   training on an NVIDIA/AMD GPU that is free VRAM (`min(real free, --vram-cap-gb)`);
+   otherwise free RAM (`min(real free, --ram-cap-gb)`). Apple GPUs share RAM, so RAM.
+   Tensors cross the network as CPU bytes and each stage moves them onto its own
+   device, so GPU and CPU laptops can be in the same pipeline.
 3. Walking the layers, each node takes layers until it reaches its proportional
    share of the model. Every later node still gets at least one layer.
 4. Every stage is checked against its node's budget. If one doesn't fit, a second

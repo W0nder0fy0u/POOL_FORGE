@@ -1,4 +1,5 @@
 # Run a whole pool on ONE Windows machine: coordinator + 2 agents with different RAM caps.
+# If this machine has a GPU, laptop-a trains on it and laptop-b stays on the CPU.
 #
 #   powershell -ExecutionPolicy Bypass -File scripts\dev_two_agents.ps1
 #   powershell -ExecutionPolicy Bypass -File scripts\dev_two_agents.ps1 -Train
@@ -34,7 +35,7 @@ try {
     $procs += Start-Process -FilePath $Py -PassThru -NoNewWindow -RedirectStandardOutput run\agent-a.log -RedirectStandardError run\agent-a.err.log `
         -ArgumentList "-m", "agent.cli", "join", $code, "--server", $Url, "--node-id", "laptop-a", "--ram-cap-gb", "1", "--workdir", "run\a"
     $procs += Start-Process -FilePath $Py -PassThru -NoNewWindow -RedirectStandardOutput run\agent-b.log -RedirectStandardError run\agent-b.err.log `
-        -ArgumentList "-m", "agent.cli", "join", $code, "--server", $Url, "--node-id", "laptop-b", "--ram-cap-gb", "2", "--workdir", "run\b"
+        -ArgumentList "-m", "agent.cli", "join", $code, "--server", $Url, "--node-id", "laptop-b", "--ram-cap-gb", "2", "--device", "cpu", "--workdir", "run\b"
     Start-Sleep -Seconds 4
 
     Write-Host ""

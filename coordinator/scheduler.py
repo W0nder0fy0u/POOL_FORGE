@@ -2,12 +2,15 @@
 
 Rules (from the project spec):
   * every node gets ONE contiguous range of layers (pipeline order),
-  * ranges are sized in proportion to each node's free RAM,
+  * ranges are sized in proportion to each node's free memory,
   * every range must fit its node, otherwise we fail with "pool too small".
+
+"Free memory" is free VRAM for a node training on an NVIDIA/AMD GPU (cuda),
+and free RAM otherwise (CPU, or Apple GPUs which share RAM with the CPU).
 
 Algorithm (simple and explainable):
   1. Estimate memory per layer with common.specs.estimate_memory.
-  2. Order nodes by free RAM, biggest first (fewer layers on weak laptops).
+  2. Order nodes by free memory, biggest first (fewer layers on weak laptops).
   3. Walk the layers; node i keeps taking layers while it stays under its
      proportional share of the model (and under its RAM budget), always
      leaving at least one layer for each remaining node.
@@ -24,14 +27,19 @@ from common.specs import estimate_memory
 
 GB = 1024 ** 3
 MB = 1024 ** 2
-# Keep 10% of each node's free RAM spare for PyTorch itself and the OS.
+# Keep 10% of each node's free memory spare for PyTorch itself and the OS / driver.
 USABLE_FRACTION = 0.9
 
 
 @dataclass
 class NodeCapacity:
     node_id: str
-    ram_free_gb: float
+    mem_free_gb: float  # free VRAM if device == "cuda", else free RAM
+    device: str = "cpu"
+
+    @property
+    def memory(self) -> str:
+        return "VRAM" if self.device == "cuda" else "RAM"
 
 
 @dataclass
@@ -42,6 +50,7 @@ class StagePlan:
     end_layer: int
     estimated_mb: float
     budget_mb: float
+    device: str = "cpu"
 
     def to_dict(self) -> Dict[str, Any]:
         return asdict(self)
@@ -63,12 +72,13 @@ def plan_split(
     total = sum(layer_mem)
 
     # Biggest node first; never more stages than layers.
-    nodes = sorted(nodes, key=lambda n: n.ram_free_gb, reverse=True)[: len(specs)]
-    budgets = [n.ram_free_gb * GB * USABLE_FRACTION for n in nodes]
+    nodes = sorted(nodes, key=lambda n: n.mem_free_gb, reverse=True)[: len(specs)]
+    budgets = [n.mem_free_gb * GB * USABLE_FRACTION for n in nodes]
     if total > sum(budgets):
         raise PoolTooSmall(
             f"pool too small: model needs ~{total / MB:.0f} MB but the pool has only "
-            f"{sum(budgets) / MB:.0f} MB usable ({len(nodes)} node(s)). Add a laptop or shrink the model."
+            f"{sum(budgets) / MB:.0f} MB usable ({len(nodes)} node(s); VRAM on GPU nodes, RAM on the rest). "
+            "Add a laptop or shrink the model."
         )
 
     try:
@@ -102,9 +112,9 @@ def _greedy(specs, nodes, layer_mem, budgets, proportional: bool) -> List[StageP
         stage_mem = sum(layer_mem[start:end])
         if stage_mem > budgets[i]:
             raise PoolTooSmall(
-                f"pool too small: node '{node.node_id}' has {budgets[i] / MB:.0f} MB usable but its "
+                f"pool too small: node '{node.node_id}' has {budgets[i] / MB:.0f} MB {node.memory} usable but its "
                 f"layers [{start}, {end}) need ~{stage_mem / MB:.0f} MB"
             )
-        plans.append(StagePlan(node.node_id, i, start, end, round(stage_mem / MB, 2), round(budgets[i] / MB, 2)))
+        plans.append(StagePlan(node.node_id, i, start, end, round(stage_mem / MB, 2), round(budgets[i] / MB, 2), node.device))
         start = end
     return plans

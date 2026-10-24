@@ -19,5 +19,10 @@ services:
         value: "30"
       - key: LOG_LEVEL
         value: INFO
-      - key: POOLFORGE_REPO_URL   # git URL shown on the Join page (set it in the Render dashboard)
+      # Optional TURN relay so voice calls work on strict networks (set in the Render dashboard)
+      - key: POOLFORGE_TURN_URL
+        sync: false
+      - key: POOLFORGE_TURN_USER
+        sync: false
+      - key: POOLFORGE_TURN_PASS
         sync: false

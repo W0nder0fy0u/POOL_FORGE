@@ -81,6 +81,7 @@ async def run_agent(tmp_path):
 
     def start(code, server, **kw):
         kw.setdefault("workdir", str(tmp_path))
+        kw.setdefault("device", "cpu")  # tests size nodes with ram_cap_gb; GPU tests pass device="cuda"
         agent = Agent(code, server, **kw)
         agent.apps.has_cloudflared = False  # never open real tunnels in tests
         task = asyncio.create_task(agent.run())

@@ -22,13 +22,14 @@ import re
 import secrets
 import string
 import struct
+import tarfile
 import time
 from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Optional
 
 from fastapi import Depends, FastAPI, Header, Request, WebSocket, WebSocketDisconnect
-from fastapi.responses import FileResponse, JSONResponse, PlainTextResponse
+from fastapi.responses import FileResponse, JSONResponse, PlainTextResponse, Response
 from pydantic import ValidationError
 
 from common import __version__
@@ -50,13 +51,15 @@ from common.schemas import (
     StopAppMsg,
     TrainingConfig,
     agent_message_adapter,
+    browser_message_adapter,
 )
 from coordinator.db import DB, hash_token
 from coordinator.hub import ApiError, Hub, NodeLive, RateLimiter, Room
 
 logger = logging.getLogger("poolforge.coordinator")
 
-DIST_DIR = Path(__file__).resolve().parent.parent / "dashboard" / "dist"
+ROOT_DIR = Path(__file__).resolve().parent.parent
+DIST_DIR = ROOT_DIR / "dashboard" / "dist"
 MAX_RELAY_FRAME = 600 * 1024 * 1024
 UINT32 = struct.Struct(">I")  # same 4-byte length prefix as common/protocol.py (kept here so no torch import)
 ROOM_RE = re.compile(ROOM_CODE_PATTERN)
@@ -69,6 +72,7 @@ def create_app(db_path: Optional[str] = None, drop_grace_s: Optional[float] = No
     # Rate limits per IP per minute (env vars let benchmarks/tests raise them).
     create_limiter = RateLimiter(limit=int(os.environ.get("POOLFORGE_ROOMS_PER_MIN", 10)), window=60)
     join_limiter = RateLimiter(limit=int(os.environ.get("POOLFORGE_JOINS_PER_MIN", 20)), window=60)
+    chat_limiter = RateLimiter(limit=20, window=10)  # per dashboard: 20 chat messages per 10 s
 
     @asynccontextmanager
     async def lifespan(_app: FastAPI):
@@ -143,6 +147,21 @@ def create_app(db_path: Optional[str] = None, drop_grace_s: Optional[float] = No
     async def apps():
         return app_catalog()
 
+    @app.get("/api/ice")
+    async def ice_servers():
+        """STUN/TURN servers the browsers use to connect a voice call to each other.
+
+        STUN (free, Google) is enough on most home Wi-Fi. Strict networks (college
+        Wi-Fi, mobile data) need a TURN relay: set POOLFORGE_TURN_URL/_USER/_PASS.
+        """
+        servers = [{"urls": "stun:stun.l.google.com:19302"}]
+        turn = os.environ.get("POOLFORGE_TURN_URL", "")
+        if turn:
+            servers.append({"urls": [u.strip() for u in turn.split(",") if u.strip()],
+                            "username": os.environ.get("POOLFORGE_TURN_USER", ""),
+                            "credential": os.environ.get("POOLFORGE_TURN_PASS", "")})
+        return {"iceServers": servers}
+
     @app.post("/api/rooms")
     async def create_room(request: Request):
         if not create_limiter.allow(client_ip(request)):
@@ -169,7 +188,8 @@ def create_app(db_path: Optional[str] = None, drop_grace_s: Optional[float] = No
         snap = hub.snapshot(room)
         snap["join_command"] = f"poolforge join {code} --server {public_url(request)}"
         snap["server"] = public_url(request)
-        snap["repo_url"] = os.environ.get("POOLFORGE_REPO_URL", "")  # shown on the Join page
+        snap["install_url"] = f"{public_url(request)}/download/poolforge.tar.gz"
+        snap["install_command"] = f"pip install {snap['install_url']}"
         return snap
 
     @app.post("/api/rooms/{code}/join", response_model=JoinResponse)
@@ -245,7 +265,7 @@ def create_app(db_path: Optional[str] = None, drop_grace_s: Optional[float] = No
         buf = io.StringIO()
         writer = csv.writer(buf)
         writer.writerow(["step", "epoch", "loss", "step_time_ms", "samples_per_s", "node_id", "stage",
-                         "bytes_sent", "bytes_received", "avg_send_ms", "proc_ram_mb"])
+                         "bytes_sent", "bytes_received", "avg_send_ms", "proc_ram_mb", "gpu_mem_mb"])
         by_step = {}
         for nm in job["node_metrics"]:
             by_step.setdefault(nm["step"], []).append(nm)
@@ -253,7 +273,7 @@ def create_app(db_path: Optional[str] = None, drop_grace_s: Optional[float] = No
             for nm in by_step.get(m["step"], [{}]):
                 writer.writerow([m["step"], m["epoch"], m["loss"], round(m["step_time_ms"], 2), round(m["samples_per_s"], 2),
                                  nm.get("node_id"), nm.get("stage"), nm.get("bytes_sent"), nm.get("bytes_received"),
-                                 nm.get("avg_send_ms"), nm.get("proc_ram_mb")])
+                                 nm.get("avg_send_ms"), nm.get("proc_ram_mb"), nm.get("gpu_mem_mb")])
         return PlainTextResponse(buf.getvalue(), media_type="text/csv",
                                  headers={"Content-Disposition": f'attachment; filename="{job_id}.csv"'})
 
@@ -396,21 +416,50 @@ def create_app(db_path: Optional[str] = None, drop_grace_s: Optional[float] = No
 
     @app.websocket("/ws/dashboard/{code}")
     async def dashboard_ws(ws: WebSocket, code: str):
-        """Read-only live feed for browsers. Commands go through REST with the admin token."""
+        """Live feed for browsers, plus chat and voice-call signalling.
+
+        Training/deploy commands still go through REST with the admin token;
+        this socket only accepts chat and call messages (see BrowserMessage).
+        """
         if not ROOM_RE.match(code) or not db.get_room(code):
             await ws.close(code=4404, reason="room not found")
             return
         await ws.accept()
         room = hub.room(code)
+        peer_id = secrets.token_hex(4)  # this browser tab's id in the chat / call
         room.dashboards.add(ws)
+        room.peers[peer_id] = ws
         try:
             await ws.send_text(json.dumps(hub.snapshot(room)))
+            await ws.send_text(json.dumps({"type": "hello", "peer_id": peer_id}))
             while True:
-                await ws.receive_text()  # browser pings; content ignored
+                text = await ws.receive_text()
+                if text == "ping" or len(text) > 16 * 1024:
+                    continue
+                try:
+                    msg = browser_message_adapter.validate_json(text)
+                except ValidationError:
+                    continue
+                if msg.type == "chat" and not chat_limiter.allow(peer_id):
+                    continue
+                await hub.on_browser(room, peer_id, msg)
         except (WebSocketDisconnect, RuntimeError):
             pass
         finally:
             room.dashboards.discard(ws)
+            room.peers.pop(peer_id, None)
+            await hub.leave_call(room, peer_id)
+
+    # ------------------------------------------------- agent download
+    # Friends install the agent straight from this server, so the GitHub repo can stay private:
+    #   pip install https://<server>/download/poolforge.tar.gz
+    package_cache = {}
+
+    @app.get("/download/poolforge.tar.gz", include_in_schema=False)
+    async def download_package():
+        if "tar" not in package_cache:
+            package_cache["tar"] = build_source_tarball()
+        return Response(package_cache["tar"], media_type="application/gzip")
 
     # ---------------------------------------------------- dashboard files
     @app.get("/{path:path}", include_in_schema=False)
@@ -428,6 +477,19 @@ def create_app(db_path: Optional[str] = None, drop_grace_s: Optional[float] = No
         return PlainTextResponse("Dashboard not built. Run: cd dashboard && npm install && npm run build", status_code=503)
 
     return app
+
+
+def build_source_tarball() -> bytes:
+    """Pack pyproject.toml + the Python packages into a .tar.gz that pip can install."""
+    buf = io.BytesIO()
+    with tarfile.open(fileobj=buf, mode="w:gz") as tar:
+        for name in ("pyproject.toml", "README.md"):
+            tar.add(ROOT_DIR / name, arcname=f"poolforge/{name}")
+        for package in ("agent", "common", "coordinator"):
+            for path in sorted((ROOT_DIR / package).rglob("*.py")):
+                # as_posix(): forward slashes even when the coordinator runs on Windows
+                tar.add(path, arcname=f"poolforge/{path.relative_to(ROOT_DIR).as_posix()}")
+    return buf.getvalue()
 
 
 app = create_app() if os.environ.get("POOLFORGE_NO_DEFAULT_APP") != "1" else None
