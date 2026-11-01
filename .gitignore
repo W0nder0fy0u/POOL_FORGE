@@ -31,3 +31,7 @@ node_modules/
 
 # Secrets
 .env
+
+# Desktop app build (deploy/build_app.py)
+dist-app/
+launcher/_build.py

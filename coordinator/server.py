@@ -109,6 +109,15 @@ def create_app(db_path: Optional[str] = None, drop_grace_s: Optional[float] = No
         proto = request.headers.get("x-forwarded-proto", request.url.scheme)
         return f"{proto}://{request.headers.get('host', 'localhost:8000')}"
 
+    def serve_source() -> bool:
+        # Off by default: the tarball is the agent's readable Python source.
+        return os.environ.get("POOLFORGE_SERVE_SOURCE") == "1"
+
+    def app_downloads() -> dict:
+        """Links to the desktop app builds (deploy/build_app.py), e.g. on a public releases repo."""
+        urls = {"windows": os.environ.get("POOLFORGE_APP_URL_WINDOWS", ""), "linux": os.environ.get("POOLFORGE_APP_URL_LINUX", "")}
+        return {name: url for name, url in urls.items() if url}
+
     def get_room(code: str) -> Room:
         if not ROOM_RE.match(code):
             raise ApiError(404, "Invalid room code")
@@ -188,8 +197,11 @@ def create_app(db_path: Optional[str] = None, drop_grace_s: Optional[float] = No
         snap = hub.snapshot(room)
         snap["join_command"] = f"poolforge join {code} --server {public_url(request)}"
         snap["server"] = public_url(request)
-        snap["install_url"] = f"{public_url(request)}/download/poolforge.tar.gz"
-        snap["install_command"] = f"pip install {snap['install_url']}"
+        snap["join_url"] = f"{public_url(request)}/join/{code}"
+        snap["downloads"] = app_downloads()
+        if serve_source():
+            snap["install_url"] = f"{public_url(request)}/download/poolforge.tar.gz"
+            snap["install_command"] = f"pip install {snap['install_url']}"
         return snap
 
     @app.post("/api/rooms/{code}/join", response_model=JoinResponse)
@@ -451,12 +463,15 @@ def create_app(db_path: Optional[str] = None, drop_grace_s: Optional[float] = No
             await hub.leave_call(room, peer_id)
 
     # ------------------------------------------------- agent download
-    # Friends install the agent straight from this server, so the GitHub repo can stay private:
-    #   pip install https://<server>/download/poolforge.tar.gz
+    # Friends normally use the desktop app (app_downloads). With POOLFORGE_SERVE_SOURCE=1
+    # developers can instead `pip install https://<server>/download/poolforge.tar.gz`,
+    # which hands out readable source, so it is off by default.
     package_cache = {}
 
     @app.get("/download/poolforge.tar.gz", include_in_schema=False)
     async def download_package():
+        if not serve_source():
+            raise ApiError(404, "Not found")
         if "tar" not in package_cache:
             package_cache["tar"] = build_source_tarball()
         return Response(package_cache["tar"], media_type="application/gzip")
@@ -480,12 +495,19 @@ def create_app(db_path: Optional[str] = None, drop_grace_s: Optional[float] = No
 
 
 def build_source_tarball() -> bytes:
-    """Pack pyproject.toml + the Python packages into a .tar.gz that pip can install."""
+    """Pack pyproject.toml + the agent's packages into a .tar.gz that pip can install.
+
+    The coordinator is left out (agents don't need it), so the server code stays private.
+    """
     buf = io.BytesIO()
     with tarfile.open(fileobj=buf, mode="w:gz") as tar:
-        for name in ("pyproject.toml", "README.md"):
-            tar.add(ROOT_DIR / name, arcname=f"poolforge/{name}")
-        for package in ("agent", "common", "coordinator"):
+        tar.add(ROOT_DIR / "README.md", arcname="poolforge/README.md")
+        pyproject = (ROOT_DIR / "pyproject.toml").read_text()
+        pyproject = pyproject.replace('packages = ["agent", "common", "coordinator"]', 'packages = ["agent", "common"]')
+        info = tarfile.TarInfo("poolforge/pyproject.toml")
+        info.size = len(pyproject.encode())
+        tar.addfile(info, io.BytesIO(pyproject.encode()))
+        for package in ("agent", "common"):
             for path in sorted((ROOT_DIR / package).rglob("*.py")):
                 # as_posix(): forward slashes even when the coordinator runs on Windows
                 tar.add(path, arcname=f"poolforge/{path.relative_to(ROOT_DIR).as_posix()}")

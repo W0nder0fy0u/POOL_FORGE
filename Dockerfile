@@ -26,7 +26,8 @@ COPY requirements-coordinator.txt .
 RUN pip install --no-cache-dir -r requirements-coordinator.txt
 
 # Coordinator code (no torch). agent/ + pyproject.toml are copied only so the
-# server can hand them out at /download/poolforge.tar.gz (they are not run here).
+# server can hand them out at /download/poolforge.tar.gz when POOLFORGE_SERVE_SOURCE=1
+# (they are not run here).
 COPY pyproject.toml README.md ./
 COPY agent/ agent/
 COPY common/ common/

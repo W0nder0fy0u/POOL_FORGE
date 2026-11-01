@@ -37,8 +37,9 @@ Windows: use `py -m venv .venv` and `.venv\Scripts\activate` (PowerShell may nee
 `pip install torch --index-url https://download.pytorch.org/whl/cu126` before the
 requirements, because the default Windows PyTorch is CPU-only. Linux needs nothing extra.
 
-**Friends joining a pool** don't need this repo: the Join page shows exact Windows and
-Linux/macOS commands that install the agent from the coordinator into a `poolforge-env` folder.
+**Friends joining a pool** don't need this repo or Python: they download the PoolForge
+app from the Join page, open it and paste the link. It sets itself up on first run.
+See [docs/DEPLOY.md](docs/DEPLOY.md#desktop-app-what-friends-install).
 
 **See it all on one machine (coordinator + 2 simulated laptops):**
 
@@ -102,7 +103,7 @@ Details: [ARCHITECTURE](docs/ARCHITECTURE.md) | [PROTOCOL](docs/PROTOCOL.md) | [
 | Robustness | Auto-reconnect with backoff, checkpoints every K steps, pause/resume/stop, node-drop resume, heartbeat timeout |
 | Security | Node + admin tokens (hashed), room lock, rate limits, pydantic validation, no pickle, allow-listed hosting, optional AES-256-GCM (`--encrypt-passphrase`) |
 | Hosting | Static site / Flask / allow-listed Docker images on a pool laptop, Cloudflare quick-tunnel URL or IP:port fallback |
-| Packaging | Docker image (164 MB, no torch), Render/Railway configs, PyInstaller `poolforge-agent` |
+| Packaging | Docker image (164 MB, no torch), Render/Railway configs, Nuitka-compiled desktop app (`deploy/build_app.py`) |
 
 ## Tests and benchmarks
 
@@ -131,7 +132,8 @@ common/       wire protocol, transports, layer specs, model zoo, datasets, pipel
 dashboard/    React + Vite + Recharts (src/) and the built site (dist/)
 benchmarks/   harness + run_all + results/
 Dockerfile    optional coordinator image; render.yaml = Render blueprint (native Python, no Docker)
-deploy/       railway.md, PyInstaller spec, sample apps
+deploy/       railway.md, desktop app build, PyInstaller spec, sample apps
+launcher/     the desktop app friends download (first-run setup + join window)
 docs/         architecture, protocol, decisions, limitations, demo, deploy, screenshots
 scripts/      dev_two_agents.sh / .ps1
 tests/        pytest suite (phases 0-8)

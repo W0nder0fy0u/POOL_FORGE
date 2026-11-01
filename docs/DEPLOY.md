@@ -37,9 +37,8 @@ Pick ONE of these ways.
    (Or **New -> Blueprint**: `render.yaml` in the repo root has exactly these settings.)
 3. Open `https://<name>.onrender.com/health` -> `{"status":"ok"}`.
 
-Friends do not need access to the GitHub repo (it can stay private): the Join page tells
-them to run `pip install https://<name>.onrender.com/download/poolforge.tar.gz`, which
-downloads the agent straight from your coordinator.
+Friends never need the GitHub repo (keep it private): they download the PoolForge app
+from the Join page. See [Desktop app](#desktop-app-what-friends-install) to set up the downloads.
 
 The dashboard is pre-built in `dashboard/dist`, so no Node.js step is needed. If you
 change the dashboard, run `cd dashboard && npm run build` and commit `dist/`.
@@ -75,18 +74,47 @@ demo; create the pool on the day you test.
 
 See [`deploy/railway.md`](../deploy/railway.md).
 
+## Desktop app (what friends install)
+
+Friends download one file (about 20 MB), open it, paste the join link and click **Join**.
+Nothing else to install: on first run the app downloads a private Python and PyTorch
+(the CUDA build if it finds an NVIDIA GPU, about 2.5 GB; otherwise the CPU build,
+about 200 MB) into `%LOCALAPPDATA%\PoolForge` or `~/.local/share/poolforge`. Later runs
+start in seconds. `POOLFORGE_TORCH=cpu` forces the CPU build.
+
+The agent inside the app is compiled to native code with Nuitka (no `.py` files, no
+docstrings), and the coordinator is never included. That stops casual reading of
+your code, but like any program on someone else's computer it can still be
+reverse-engineered by an expert. The coordinator code only ever runs on your server.
+
+**Build and publish** (the Windows `.exe` must be built on Windows, so GitHub does it):
+
+1. Follow the steps at the top of `.github/workflows/release-app.yml` once: a public
+   `poolforge-app` repo for the downloads, a token, and two Actions variables.
+2. `git tag v1.0.1 && git push origin v1.0.1` builds `PoolForge.exe` and
+   `PoolForge-linux` and publishes them as a release of that public repo.
+3. On Render, set `POOLFORGE_APP_URL_WINDOWS` and `POOLFORGE_APP_URL_LINUX` to the
+   `releases/latest/download/...` links (see the workflow file). The Join page then
+   shows the download buttons.
+
+Local build (Python 3.12, e.g. `uv venv --python 3.12`):
+`pip install nuitka==4.3.4 zstandard patchelf` then
+`python deploy/build_app.py --server https://<your-app>.onrender.com` -> `dist-app/`.
+
+The Windows app is not code-signed, so SmartScreen shows "Windows protected your PC"
+the first time (More info -> Run anyway). Signing needs a paid certificate.
+
+**Developers** can still use `pip install -e .` from the repo. Set
+`POOLFORGE_SERVE_SOURCE=1` on the coordinator to re-enable the old
+`/download/poolforge.tar.gz` pip install (it hands out the agent's readable source,
+never the coordinator's).
+
 ## Friends on other networks
 
 1. Deploy with option 2 or 3 to get a public HTTPS URL.
 2. Open it, **Create Pool**, and send the join link.
-3. Each friend: install Python 3.10+, then
-   `git clone <repo> && cd poolforge && pip install -e .`, then run the command shown
-   on the join page: `poolforge join CODE --server https://<your-app>.onrender.com`.
+3. Each friend downloads the app from the link, opens it and pastes the link.
    No router settings are needed: everything is outbound HTTPS/WSS.
-
-Without Python: build `poolforge-agent` with PyInstaller (`deploy/poolforge-agent.spec`,
-build on Windows for a Windows `.exe`) and share the folder. Run it the same way:
-`poolforge-agent join CODE --server URL`.
 
 ## Same Wi-Fi / Tailscale (faster)
 

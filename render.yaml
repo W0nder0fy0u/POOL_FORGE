@@ -26,3 +26,8 @@ services:
         sync: false
       - key: POOLFORGE_TURN_PASS
         sync: false
+      # Desktop app download links shown on the Join page (see docs/DEPLOY.md)
+      - key: POOLFORGE_APP_URL_WINDOWS
+        sync: false
+      - key: POOLFORGE_APP_URL_LINUX
+        sync: false

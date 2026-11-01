@@ -1,0 +1,85 @@
+# Builds the PoolForge desktop app (deploy/build_app.py) for Windows and Linux.
+# Run it by pushing a version tag:   git tag v1.0.1 && git push origin v1.0.1
+# (or by hand: Actions -> release-app -> Run workflow; that only keeps artifacts).
+#
+# This code repo is private, so friends can't download from its releases. Tagged builds
+# are published to a separate PUBLIC repo that holds only the app files, no code:
+#   1. Create an empty public repo, e.g. <you>/poolforge-app (add a README so it has a branch).
+#   2. Create a fine-grained token with "Contents: read and write" on that repo only.
+#   3. Here: Settings -> Secrets and variables -> Actions
+#        secret    APP_RELEASES_TOKEN = the token
+#        variable  APP_RELEASES_REPO  = <you>/poolforge-app
+#        variable  POOLFORGE_SERVER   = https://my-pool.onrender.com  (optional: lets friends type just the code)
+#   4. On Render set
+#        POOLFORGE_APP_URL_WINDOWS = https://github.com/<you>/poolforge-app/releases/latest/download/PoolForge.exe
+#        POOLFORGE_APP_URL_LINUX   = https://github.com/<you>/poolforge-app/releases/latest/download/PoolForge-linux
+name: release-app
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            built: PoolForge.exe
+            asset: PoolForge.exe
+          - os: ubuntu-22.04  # older glibc, so the Linux app also runs on older distros
+            built: PoolForge
+            asset: PoolForge-linux
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"  # must match PYTHON_VERSION in launcher/setup_env.py
+      - name: Install build tools
+        run: python -m pip install nuitka==4.3.4 zstandard==0.25.0
+      - name: Install patchelf (Linux)
+        if: runner.os == 'Linux'
+        run: python -m pip install patchelf==0.19.1.0
+      - name: Build
+        shell: bash
+        run: |
+          args=(--server "${{ vars.POOLFORGE_SERVER }}")
+          if [[ "$GITHUB_REF_TYPE" == tag ]]; then args+=(--version "${GITHUB_REF_NAME#v}"); fi
+          python deploy/build_app.py "${args[@]}"
+          if [[ "${{ matrix.built }}" != "${{ matrix.asset }}" ]]; then mv "dist-app/${{ matrix.built }}" "dist-app/${{ matrix.asset }}"; fi
+      - name: Smoke test the app window (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update && sudo apt-get install -y xvfb
+          POOLFORGE_SELFTEST=1 xvfb-run -a "dist-app/${{ matrix.asset }}"  # fails the build if Tk can't load
+      - name: Smoke test the app window (Windows)
+        if: runner.os == 'Windows'
+        env:
+          POOLFORGE_SELFTEST: "1"
+        run: ./dist-app/${{ matrix.asset }}
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.asset }}
+          path: dist-app/${{ matrix.asset }}
+
+  publish:
+    needs: build
+    if: github.ref_type == 'tag' && vars.APP_RELEASES_REPO != ''
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: out
+          merge-multiple: true
+      - uses: softprops/action-gh-release@v2
+        with:
+          repository: ${{ vars.APP_RELEASES_REPO }}
+          token: ${{ secrets.APP_RELEASES_TOKEN }}
+          tag_name: ${{ github.ref_name }}
+          name: PoolForge ${{ github.ref_name }}
+          body: Download PoolForge.exe (Windows) or PoolForge-linux (Linux), open it, and paste your pool's join link.
+          files: out/*
