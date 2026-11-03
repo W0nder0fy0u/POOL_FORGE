@@ -7,12 +7,12 @@
 import { useEffect, useState } from "react";
 import { Link, useParams } from "react-router-dom";
 import { api } from "../api.js";
+import AppDownloads from "../components/AppDownloads.jsx";
 import ThemeToggle from "../components/ThemeToggle.jsx";
 import { CopyBox } from "../components/ui.jsx";
 
 const CUDA_TORCH = "https://download.pytorch.org/whl/cu126";
 const isWindows = () => /Windows/i.test(navigator.userAgent);
-const OS_LABEL = { windows: "Windows", linux: "Linux" };
 
 function commands(os, info, code, nvidia) {
   if (os === "windows") {
@@ -83,9 +83,6 @@ export default function Join() {
   }, [code]);
 
   const online = info ? info.nodes.filter((n) => n.online).length : 0;
-  const mine = isWindows() ? "windows" : "linux";
-  // The visitor's own OS first, as the big button.
-  const downloads = info ? Object.entries(info.downloads || {}).sort(([a]) => (a === mine ? -1 : 1)) : [];
   return (
     <>
       <header className="topbar">
@@ -99,39 +96,27 @@ export default function Join() {
         <h1>Join pool {code}</h1>
         {error && <div className="banner error">{error}</div>}
         {info && (
+          <p className="secondary">
+            {online} laptop{online === 1 ? " is" : "s are"} in this pool right now. Add yours in two steps. It connects out to the
+            pool server, so no router or firewall changes are needed.
+          </p>
+        )}
+        {/* Step 1 shows even if the pool can't be loaded, so the app is always downloadable. */}
+        <section className="card stack">
+          <div>
+            <h3>Step 1 - download PoolForge</h3>
+            <AppDownloads downloads={info?.downloads} />
+          </div>
+          {info && (
+            <div>
+              <h3>Step 2 - open it and paste this link</h3>
+              <CopyBox text={info.join_url} />
+              <p className="muted small">Click Join and keep the window open. Close it (or click Leave) to leave the pool.</p>
+            </div>
+          )}
+        </section>
+        {info && (
           <>
-            <p className="secondary">
-              {online} laptop{online === 1 ? " is" : "s are"} in this pool right now. Add yours in two steps. It connects out to
-              the pool server, so no router or firewall changes are needed.
-            </p>
-            <section className="card stack">
-              <div>
-                <h3>Step 1 - download PoolForge</h3>
-                {downloads.length ? (
-                  <div className="row" style={{ flexWrap: "wrap", gap: "0.6rem" }}>
-                    {downloads.map(([os, url], i) => (
-                      <a key={os} className={`button${i === 0 ? " primary" : ""}`} href={url}>
-                        Download for {OS_LABEL[os] || os}
-                      </a>
-                    ))}
-                  </div>
-                ) : (
-                  <div className="banner warning">App downloads aren't set up on this server yet. Ask the pool owner for the PoolForge app.</div>
-                )}
-                <p className="muted small">
-                  About 20 MB. The first time you open it, it sets itself up once: about 200 MB, or about 2.5 GB if your laptop has an
-                  NVIDIA GPU (it then trains on the GPU). No Python or other installs needed.
-                  {mine === "windows"
-                    ? ' If Windows says "Windows protected your PC", click More info, then Run anyway.'
-                    : " On Linux, make the file runnable first: chmod +x PoolForge-linux, then ./PoolForge-linux"}
-                </p>
-              </div>
-              <div>
-                <h3>Step 2 - open it and paste this link</h3>
-                <CopyBox text={info.join_url} />
-                <p className="muted small">Click Join and keep the window open. Close it (or click Leave) to leave the pool.</p>
-              </div>
-            </section>
             {info.install_url && <PythonInstall info={info} code={code} />}
             <Link to={`/room/${code}/nodes`}>Watch the pool dashboard</Link>
           </>

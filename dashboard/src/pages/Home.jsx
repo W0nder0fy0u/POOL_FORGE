@@ -2,6 +2,7 @@
 import { useState } from "react";
 import { useNavigate } from "react-router-dom";
 import { api, setAdminToken } from "../api.js";
+import AppDownloads from "../components/AppDownloads.jsx";
 import ThemeToggle from "../components/ThemeToggle.jsx";
 import { CopyBox } from "../components/ui.jsx";
 
@@ -71,6 +72,11 @@ export default function Home() {
             </div>
           </section>
         )}
+
+        <section className="card stack">
+          <h2>Download the PoolForge app</h2>
+          <AppDownloads />
+        </section>
 
         <section className="card">
           <h2>Open an existing pool</h2>

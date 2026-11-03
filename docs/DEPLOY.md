@@ -93,9 +93,10 @@ reverse-engineered by an expert. The coordinator code only ever runs on your ser
    `poolforge-app` repo for the downloads, a token, and two Actions variables.
 2. `git tag v1.0.1 && git push origin v1.0.1` builds `PoolForge.exe` and
    `PoolForge-linux` and publishes them as a release of that public repo.
-3. On Render, set `POOLFORGE_APP_URL_WINDOWS` and `POOLFORGE_APP_URL_LINUX` to the
-   `releases/latest/download/...` links (see the workflow file). The Join page then
-   shows the download buttons.
+3. The home page and every Join page show the download buttons, on any device. They
+   link to the latest release of `W0nder0fy0u/poolforge-app` (`APP_RELEASES` in
+   `coordinator/server.py`). To point them somewhere else, set
+   `POOLFORGE_APP_URL_WINDOWS` and `POOLFORGE_APP_URL_LINUX` on Render.
 
 Local build (Python 3.12, e.g. `uv venv --python 3.12`):
 `pip install nuitka==4.3.4 zstandard patchelf` then

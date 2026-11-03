@@ -84,7 +84,7 @@ async def test_source_download_off_by_default(coordinator, monkeypatch):
     assert (await coordinator.http.get("/download/poolforge.tar.gz")).status_code == 404
     room = await coordinator.create_room()
     info = (await coordinator.http.get(f"/api/rooms/{room['room_code']}")).json()
-    assert "install_url" not in info and info["downloads"] == {}
+    assert "install_url" not in info
 
 
 async def test_source_download_opt_in_has_no_coordinator(coordinator, monkeypatch):
@@ -102,7 +102,11 @@ async def test_room_info_lists_app_downloads(coordinator, monkeypatch):
     room = await coordinator.create_room()
     code = room["room_code"]
     info = (await coordinator.http.get(f"/api/rooms/{code}")).json()
-    assert info["downloads"] == {"windows": "https://dl.example/PoolForge.exe"}
+    # An env var overrides its link; the other falls back to the public releases repo.
+    assert info["downloads"] == {
+        "windows": "https://dl.example/PoolForge.exe",
+        "linux": "https://github.com/W0nder0fy0u/poolforge-app/releases/latest/download/PoolForge-linux",
+    }
     assert info["join_url"].endswith(f"/join/{code}")
     assert env.parse_link(info["join_url"]) == (info["server"], code)
 
@@ -111,3 +115,12 @@ async def test_room_info_lists_app_downloads(coordinator, monkeypatch):
 def test_python_url_for_this_os():
     url = env.PYTHON_URL.format(release=env.PYTHON_RELEASE, version=env.PYTHON_VERSION, target=env.PYTHON_TARGETS[env.os_name()])
     assert url.startswith("https://github.com/astral-sh/python-build-standalone/") and env.PYTHON_VERSION in url
+
+
+async def test_app_downloads_always_offered(coordinator, monkeypatch):
+    monkeypatch.delenv("POOLFORGE_APP_URL_WINDOWS", raising=False)
+    monkeypatch.setenv("POOLFORGE_APP_URL_LINUX", "")
+    links = (await coordinator.http.get("/api/downloads")).json()
+    assert set(links) == {"windows", "linux"}
+    assert links["windows"].endswith("/releases/latest/download/PoolForge.exe")
+    assert links["linux"].endswith("/releases/latest/download/PoolForge-linux")

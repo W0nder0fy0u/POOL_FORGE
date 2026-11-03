@@ -61,6 +61,8 @@ logger = logging.getLogger("poolforge.coordinator")
 ROOT_DIR = Path(__file__).resolve().parent.parent
 DIST_DIR = ROOT_DIR / "dashboard" / "dist"
 MAX_RELAY_FRAME = 600 * 1024 * 1024
+# Latest desktop app builds (published by .github/workflows/release-app.yml).
+APP_RELEASES = "https://github.com/W0nder0fy0u/poolforge-app/releases/latest/download"
 UINT32 = struct.Struct(">I")  # same 4-byte length prefix as common/protocol.py (kept here so no torch import)
 ROOM_RE = re.compile(ROOM_CODE_PATTERN)
 
@@ -114,9 +116,12 @@ def create_app(db_path: Optional[str] = None, drop_grace_s: Optional[float] = No
         return os.environ.get("POOLFORGE_SERVE_SOURCE") == "1"
 
     def app_downloads() -> dict:
-        """Links to the desktop app builds (deploy/build_app.py), e.g. on a public releases repo."""
-        urls = {"windows": os.environ.get("POOLFORGE_APP_URL_WINDOWS", ""), "linux": os.environ.get("POOLFORGE_APP_URL_LINUX", "")}
-        return {name: url for name, url in urls.items() if url}
+        """Links to the desktop app builds (deploy/build_app.py) on the public releases repo.
+        Always present so the site can offer the app; the env vars override the defaults."""
+        return {
+            "windows": os.environ.get("POOLFORGE_APP_URL_WINDOWS") or f"{APP_RELEASES}/PoolForge.exe",
+            "linux": os.environ.get("POOLFORGE_APP_URL_LINUX") or f"{APP_RELEASES}/PoolForge-linux",
+        }
 
     def get_room(code: str) -> Room:
         if not ROOM_RE.match(code):
@@ -155,6 +160,10 @@ def create_app(db_path: Optional[str] = None, drop_grace_s: Optional[float] = No
     @app.get("/api/apps")
     async def apps():
         return app_catalog()
+
+    @app.get("/api/downloads")
+    async def downloads():
+        return app_downloads()
 
     @app.get("/api/ice")
     async def ice_servers():
