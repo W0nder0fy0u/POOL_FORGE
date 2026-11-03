@@ -74,7 +74,8 @@ def main() -> None:
     try:
         nuitka(sys.executable, "--onefile", "--enable-plugin=tk-inter", "--include-package=launcher",
                "--nofollow-import-to=agent,common,coordinator,torch",
-               f"--include-data-dir={PAYLOAD}=launcher/payload",
+               # raw-dir, not data-dir: data-dir silently drops code files, i.e. the compiled .pyd/.so agent
+               f"--include-raw-dir={PAYLOAD}=launcher/payload",
                "--windows-console-mode=disable", "--product-name=PoolForge", "--company-name=PoolForge",
                f"--file-version={version}", f"--product-version={version}",
                f"--output-dir={OUT}", f"--output-filename={name}", "launcher/app.py")

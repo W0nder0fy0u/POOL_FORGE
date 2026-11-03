@@ -60,6 +60,26 @@ def test_agent_payload_copied_once_per_version(tmp_path, monkeypatch, home):
     assert (lib / "agent.so").read_text() == "v2"  # app updated: new agent installed
 
 
+def test_agent_missing_from_app_is_a_clear_error(tmp_path, monkeypatch, home):
+    payload = tmp_path / "payload"
+    (payload / "deploy" / "sample_apps").mkdir(parents=True)  # what a data-dir build shipped: no agent
+    monkeypatch.setattr(env, "PAYLOAD_DIR", payload)
+    with pytest.raises(env.SetupError, match="missing its agent"):
+        env.ensure_agent(lambda m: None)
+
+
+def test_broken_agent_install_is_repaired(tmp_path, monkeypatch, home):
+    payload = tmp_path / "payload"
+    payload.mkdir()
+    (payload / "agent.cp312-win_amd64.pyd").write_text("fixed")
+    monkeypatch.setattr(env, "PAYLOAD_DIR", payload)
+    monkeypatch.setattr(env, "VERSION", "1.0.2")
+    (env.data_dir() / "lib").mkdir(parents=True)  # left behind by the broken build, same version
+    env._write_json(env.data_dir() / "state.json", {"agent": "1.0.2"})
+    lib = env.ensure_agent(lambda m: None)
+    assert (lib / "agent.cp312-win_amd64.pyd").read_text() == "fixed"
+
+
 def test_from_source_uses_the_repo(monkeypatch, tmp_path):
     monkeypatch.setattr(env, "PAYLOAD_DIR", tmp_path / "missing")
     assert (env.ensure_agent(lambda m: None) / "agent" / "cli.py").exists()

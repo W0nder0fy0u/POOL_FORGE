@@ -215,13 +215,20 @@ def ensure_deps(log: Log, progress: Progress) -> str:
     return variant
 
 
+def has_agent(folder: Path) -> bool:
+    """True if the folder holds the compiled agent module (agent.*.pyd on Windows, agent.*.so on Linux)."""
+    return folder.is_dir() and any(f.suffix in (".pyd", ".so") for f in folder.glob("agent.*"))
+
+
 def ensure_agent(log: Log) -> Path:
     """Copy the compiled agent out of the app (once per app version). Returns the folder for PYTHONPATH."""
     if not PAYLOAD_DIR.is_dir():  # running from source (developers): use the repo itself
         return REPO_ROOT
+    if not has_agent(PAYLOAD_DIR):
+        raise SetupError("This copy of PoolForge is missing its agent. Download the latest version and try again.")
     lib = data_dir() / "lib"
     state = _read_json(data_dir() / "state.json")
-    if state.get("agent") != VERSION or not lib.is_dir():
+    if state.get("agent") != VERSION or not has_agent(lib):
         log("Installing the PoolForge agent...")
         shutil.rmtree(lib, ignore_errors=True)
         shutil.copytree(PAYLOAD_DIR, lib)

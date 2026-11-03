@@ -161,7 +161,10 @@ def main() -> None:
     root = tk.Tk()
     App(root, link=sys.argv[1] if len(sys.argv) > 1 else "")
     if os.environ.get("POOLFORGE_SELFTEST") == "1":
-        # CI builds the binary then runs it like this to prove the window (Tk) really loads.
+        # CI builds the binary then runs it like this to prove the window (Tk) really loads
+        # and the compiled agent was bundled (__compiled__ only exists in the Nuitka build).
+        if "__compiled__" in globals() and not env.has_agent(env.PAYLOAD_DIR):
+            sys.exit(f"Self-test failed: no compiled agent in {env.PAYLOAD_DIR}")
         root.update()
         root.after(300, root.destroy)
     root.mainloop()
