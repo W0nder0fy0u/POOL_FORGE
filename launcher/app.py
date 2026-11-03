@@ -45,6 +45,15 @@ class App:
         self.leave_btn = ttk.Button(row, text="Leave", command=self.leave, state="disabled")
         self.leave_btn.pack(side="left", padx=(8, 0))
 
+        # Unticked: the CPU build of PyTorch (about 200 MB) and --device cpu, so the GPU is never used.
+        has_gpu = env.has_nvidia_gpu()
+        self.share_gpu = tk.BooleanVar(value=has_gpu and env.load_config().get("share_gpu", True))
+        self.gpu_box = ttk.Checkbutton(frame, variable=self.share_gpu, state="normal" if has_gpu else "disabled",
+                                       text="Share my NVIDIA GPU (the first time this downloads about 2.5 GB)" if has_gpu
+                                       else "Share my GPU (no NVIDIA GPU found: this laptop shares its CPU)")
+        self.gpu_box.pack(anchor="w", pady=(0, 10))
+        self.gpu_box_state = "normal" if has_gpu else "disabled"
+
         self.status = tk.StringVar(value="Paste the link and click Join.")
         status = ttk.Label(frame, textvariable=self.status, font=("TkDefaultFont", 10, "bold"), wraplength=520)
         status.pack(anchor="w", fill="x")
@@ -95,6 +104,7 @@ class App:
         self.join_btn.configure(state="disabled" if busy else "normal")
         self.entry.configure(state="disabled" if busy else "normal")
         self.leave_btn.configure(state="normal" if busy else "disabled")
+        self.gpu_box.configure(state="disabled" if busy else self.gpu_box_state)
         if not busy:
             self.set_progress(0)
 
@@ -106,10 +116,13 @@ class App:
         except ValueError as exc:
             self.status.set(str(exc))
             return
+        use_gpu = self.share_gpu.get()
+        if self.gpu_box_state == "normal":  # keep the saved choice when there is no GPU to choose about
+            env.save_config(share_gpu=use_gpu)
         env.save_config(last_link=self.link.get().strip(), server=server)
         self.leaving = False
         self.set_busy(True)
-        threading.Thread(target=self.run, args=(server, code), daemon=True).start()
+        threading.Thread(target=self.run, args=(server, code, use_gpu), daemon=True).start()
 
     def leave(self) -> None:
         self.leaving = True
@@ -126,15 +139,15 @@ class App:
     def send(self, kind: str, value=None) -> None:
         self.events.put((kind, value))
 
-    def run(self, server: str, code: str) -> None:
+    def run(self, server: str, code: str, use_gpu: bool) -> None:
         try:
             self.send("status", "Setting up (the first time takes a few minutes)...")
-            lib = env.prepare(lambda m: self.send("log", m), lambda p: self.send("progress", p))
+            lib = env.prepare(lambda m: self.send("log", m), lambda p: self.send("progress", p), use_gpu)
             if self.leaving:
                 return
             self.send("progress", None)
             self.send("status", f"Connecting to pool {code}...")
-            self.proc = env.start_agent(server, code, lib)
+            self.proc = env.start_agent(server, code, lib, use_gpu)
             for line in self.proc.stdout:
                 line = line.rstrip()
                 self.send("log", line)

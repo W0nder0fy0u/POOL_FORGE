@@ -91,6 +91,26 @@ def test_agent_command_joins_with_fixed_node_id():
     assert cmd[cmd.index("join") + 1] == "ABC123"
     assert cmd[cmd.index("--server") + 1] == "https://p.example"
     assert cmd[cmd.index("--node-id") + 1] == env.node_id()
+    assert cmd[cmd.index("--device") + 1] == "auto"
+    no_gpu = env.agent_command("https://p.example", "ABC123", use_gpu=False)
+    assert no_gpu[no_gpu.index("--device") + 1] == "cpu"
+
+
+def test_gpu_sharing_choice_picks_the_pytorch_download(monkeypatch, home):
+    monkeypatch.delenv("POOLFORGE_TORCH", raising=False)
+    monkeypatch.setattr(env, "has_nvidia_gpu", lambda: True)
+    downloads = []
+    monkeypatch.setattr(env, "_pip", lambda args, log, progress: downloads.append(args[-1]))
+    quiet = (lambda m: None, lambda p: None)
+
+    assert env.ensure_deps(*quiet, use_gpu=False) == "cpu"  # unticked: no 2.5 GB GPU download
+    assert downloads == [env.TORCH_INDEX.format(variant="cpu"), env.DEPS[-1]]
+    downloads.clear()
+    assert env.ensure_deps(*quiet, use_gpu=False) == "cpu" and not downloads  # already installed
+    assert env.ensure_deps(*quiet, use_gpu=True) == "cu126"  # ticked later: now fetch the GPU build
+    assert downloads[0] == env.TORCH_INDEX.format(variant="cu126")
+    downloads.clear()
+    assert env.ensure_deps(*quiet, use_gpu=False) == "cu126" and not downloads  # GPU build kept, run with --device cpu
 
 
 def test_compiled_python_version_matches_ci():

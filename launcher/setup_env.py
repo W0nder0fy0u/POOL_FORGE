@@ -198,20 +198,30 @@ def _pip(args: List[str], log: Log, progress: Progress) -> None:
         raise SetupError("Installing PoolForge's parts failed (details above). Check your internet connection and try again.")
 
 
-def ensure_deps(log: Log, progress: Progress) -> str:
-    """Install PyTorch (GPU or CPU build) and the agent's other libraries. Returns the variant."""
+def _deps_key(variant: str) -> str:
+    return hashlib.sha256(json.dumps([variant, TORCH, DEPS]).encode()).hexdigest()[:16]
+
+
+def installed_torch() -> Optional[str]:
+    """The PyTorch build that is already installed ("cu126" or "cpu"), if it is up to date."""
+    deps = _read_json(data_dir() / "state.json").get("deps")
+    return next((v for v in ("cu126", "cpu") if deps == _deps_key(v)), None)
+
+
+def ensure_deps(log: Log, progress: Progress, use_gpu: bool = True) -> str:
+    """Install PyTorch (GPU or CPU build) and the agent's other libraries. Returns the installed variant.
+    use_gpu=False never downloads the GPU build; an existing GPU build is kept (it also runs on the CPU)."""
     # POOLFORGE_TORCH=cpu skips the big GPU download even when there is an NVIDIA GPU
-    variant = os.environ.get("POOLFORGE_TORCH") or ("cu126" if has_nvidia_gpu() else "cpu")
-    wanted = hashlib.sha256(json.dumps([variant, TORCH, DEPS]).encode()).hexdigest()[:16]
-    state = _read_json(data_dir() / "state.json")
-    if state.get("deps") == wanted:
-        return variant
+    variant = os.environ.get("POOLFORGE_TORCH") or ("cu126" if use_gpu and has_nvidia_gpu() else "cpu")
+    installed = installed_torch()
+    if installed == variant or (installed and variant == "cpu"):
+        return installed
     size = "about 2.5 GB" if variant != "cpu" else "about 200 MB"
     log(f"Installing PyTorch for {'your NVIDIA GPU' if variant != 'cpu' else 'CPU'} ({size}, only once)...")
     _pip([*TORCH, "--index-url", TORCH_INDEX.format(variant=variant)], log, progress)
     log("Installing the remaining libraries...")
     _pip(DEPS, log, progress)
-    _write_json(data_dir() / "state.json", {**_read_json(data_dir() / "state.json"), "deps": wanted})
+    _write_json(data_dir() / "state.json", {**_read_json(data_dir() / "state.json"), "deps": _deps_key(variant)})
     return variant
 
 
@@ -236,26 +246,30 @@ def ensure_agent(log: Log) -> Path:
     return lib
 
 
-def prepare(log: Log, progress: Progress) -> Path:
+def prepare(log: Log, progress: Progress, use_gpu: bool = True) -> Path:
     """Run every setup step that isn't done yet. Returns the agent's PYTHONPATH folder."""
     os_name()
     ensure_python(log, progress)
-    variant = ensure_deps(log, progress)
+    variant = ensure_deps(log, progress, use_gpu)
     lib = ensure_agent(log)
     log(f"Ready (PoolForge {VERSION}, {'GPU' if variant != 'cpu' else 'CPU'} build of PyTorch).")
+    if variant != "cpu" and not use_gpu:
+        log("GPU sharing is off: this laptop shares only its CPU and RAM.")
     return lib
 
 
-def agent_command(server: str, code: str) -> List[str]:
+def agent_command(server: str, code: str, use_gpu: bool = True) -> List[str]:
     work = data_dir() / "work"
     work.mkdir(parents=True, exist_ok=True)
     return [str(python_exe()), "-u", "-c", "import sys; from agent.cli import main; sys.exit(main())",
-            "join", code, "--server", server, "--node-id", node_id(), "--workdir", str(work)]
+            "join", code, "--server", server, "--node-id", node_id(), "--workdir", str(work),
+            # cpu keeps the GPU out of the pool even when the GPU build of PyTorch is installed
+            "--device", "auto" if use_gpu else "cpu"]
 
 
-def start_agent(server: str, code: str, lib: Path) -> subprocess.Popen:
+def start_agent(server: str, code: str, lib: Path, use_gpu: bool = True) -> subprocess.Popen:
     env = {**os.environ, "PYTHONPATH": str(lib), "PYTHONUNBUFFERED": "1", "PYTHONIOENCODING": "utf-8"}
-    return subprocess.Popen(agent_command(server, code), stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
+    return subprocess.Popen(agent_command(server, code, use_gpu), stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
                             errors="replace", env=env, cwd=str(data_dir() / "work"), **_no_window())
 
 

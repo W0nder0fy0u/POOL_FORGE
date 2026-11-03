@@ -80,7 +80,9 @@ Friends download one file (about 20 MB), open it, paste the join link and click 
 Nothing else to install: on first run the app downloads a private Python and PyTorch
 (the CUDA build if it finds an NVIDIA GPU, about 2.5 GB; otherwise the CPU build,
 about 200 MB) into `%LOCALAPPDATA%\PoolForge` or `~/.local/share/poolforge`. Later runs
-start in seconds. `POOLFORGE_TORCH=cpu` forces the CPU build.
+start in seconds. Unticking **Share my NVIDIA GPU** in the app skips the GPU download and
+keeps the GPU out of the pool (the agent runs with `--device cpu`); an already installed
+GPU build is reused. `POOLFORGE_TORCH=cpu` forces the CPU build.
 
 The agent inside the app is compiled to native code with Nuitka (no `.py` files, no
 docstrings), and the coordinator is never included. That stops casual reading of
